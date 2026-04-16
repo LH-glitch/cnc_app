@@ -43,6 +43,12 @@ import threading
 import uuid
 from typing import Any, Dict, List, Optional
 
+# Must be set before any slicer import to avoid "no display" errors on
+# headless servers (Railway, Heroku, etc.).  Agg is a non-interactive
+# PNG/SVG backend; it has no dependency on X11 or a display.
+import matplotlib
+matplotlib.use('Agg')
+
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -62,11 +68,30 @@ app = FastAPI(
     version='1.0.0',
 )
 
+# CORS origins are read from the environment so the same binary works
+# locally (allow localhost) and in production (allow the Vercel domain).
+#
+# Local dev:   CORS_ORIGINS not set → allow localhost:3000 + localhost:3001
+# Production:  CORS_ORIGINS=https://your-app.vercel.app
+#
+# Multiple origins: comma-separated
+#   CORS_ORIGINS=https://your-app.vercel.app,https://staging.vercel.app
+_cors_env = os.environ.get('CORS_ORIGINS', '')
+_cors_origins: list[str] = (
+    [o.strip() for o in _cors_env.split(',') if o.strip()]
+    if _cors_env
+    else ['http://localhost:3000', 'http://localhost:3001']
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],   # tighten in production
-    allow_methods=['*'],
-    allow_headers=['*'],
+    allow_origins=_cors_origins,
+    # Catch-all for any Vercel deployment (preview + production URLs).
+    # The explicit CORS_ORIGINS env var takes precedence for tighter control.
+    allow_origin_regex=r'https://.*\.vercel\.app',
+    allow_methods=['GET', 'POST', 'OPTIONS'],
+    allow_headers=['Content-Type', 'Accept'],
+    expose_headers=['Content-Disposition'],  # needed so JS can read the filename
 )
 
 

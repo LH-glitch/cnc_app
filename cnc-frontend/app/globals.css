@@ -1,0 +1,181 @@
+@import "tailwindcss";
+
+/* ── Design tokens ─────────────────────────────────────────────────────────── */
+:root {
+  --bg-deep:      #04040f;
+  --bg-mid:       #080818;
+  --glass-bg:     rgba(255, 255, 255, 0.04);
+  --glass-border: rgba(255, 255, 255, 0.09);
+  --glass-hover:  rgba(255, 255, 255, 0.07);
+  --accent-from:  #7c3aed;
+  --accent-to:    #0ea5e9;
+  --accent-glow:  rgba(124, 58, 237, 0.45);
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-muted:   rgba(255, 255, 255, 0.45);
+  --text-subtle:  rgba(255, 255, 255, 0.22);
+}
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+/* ── Base ──────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Ambient gradient canvas */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(ellipse 70% 55% at 15% 8%,  rgba(124,58,237,0.20) 0%, transparent 60%),
+    radial-gradient(ellipse 55% 45% at 85% 85%, rgba(14,165,233,0.16) 0%, transparent 60%),
+    linear-gradient(180deg, #06060f 0%, #030309 100%);
+  pointer-events: none;
+}
+
+/* ── Glass panel ───────────────────────────────────────────────────────────── */
+.glass {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border-radius: 16px;
+}
+.glass-sm {
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-radius: 10px;
+}
+
+/* ── Glow button ───────────────────────────────────────────────────────────── */
+.btn-glow {
+  background: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+  color: #fff;
+  font-weight: 600;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: box-shadow 0.2s, transform 0.12s, opacity 0.15s;
+}
+.btn-glow:hover:not(:disabled) {
+  box-shadow: 0 0 28px 6px var(--accent-glow);
+  transform: translateY(-1px);
+}
+.btn-glow:active:not(:disabled) { transform: translateY(0); opacity: 0.88; }
+.btn-glow:disabled               { opacity: 0.38; cursor: not-allowed; }
+
+/* ── Ghost button ──────────────────────────────────────────────────────────── */
+.btn-ghost {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
+  font-weight: 500;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.12s;
+  backdrop-filter: blur(8px);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--glass-hover);
+  border-color: rgba(255,255,255,0.18);
+  transform: translateY(-1px);
+}
+.btn-ghost:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* ── Inputs ────────────────────────────────────────────────────────────────── */
+.input-dark {
+  background: rgba(0,0,0,0.35);
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.input-dark:focus {
+  border-color: rgba(124,58,237,0.6);
+  box-shadow: 0 0 0 3px rgba(124,58,237,0.14);
+}
+.input-dark::placeholder { color: var(--text-subtle); }
+
+/* ── Progress bar ──────────────────────────────────────────────────────────── */
+.progress-track {
+  background: rgba(255,255,255,0.07);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 9999px;
+  background: linear-gradient(90deg, var(--accent-from), var(--accent-to));
+  transition: width 0.25s ease;
+  box-shadow: 0 0 10px var(--accent-glow);
+}
+
+/* ── Segmented pill control ────────────────────────────────────────────────── */
+.seg-control {
+  display: flex;
+  background: rgba(0,0,0,0.30);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  padding: 3px;
+  gap: 2px;
+}
+.seg-btn {
+  flex: 1;
+  padding: 6px 14px;
+  border-radius: 7px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: transparent;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.seg-btn.active {
+  background: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+  color: #fff;
+}
+
+/* ── Drop zone ─────────────────────────────────────────────────────────────── */
+.dropzone {
+  border: 2px dashed rgba(255,255,255,0.12);
+  border-radius: 14px;
+  transition: border-color 0.2s, background 0.2s;
+  cursor: pointer;
+}
+.dropzone:hover, .dropzone.over {
+  border-color: rgba(124,58,237,0.55);
+  background: rgba(124,58,237,0.05);
+}
+
+/* ── Chips ─────────────────────────────────────────────────────────────────── */
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 10px; border-radius: 9999px;
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.chip-violet { background: rgba(124,58,237,0.18); color: #c4b5fd; border: 1px solid rgba(124,58,237,0.28); }
+.chip-sky    { background: rgba(14,165,233,0.14);  color: #7dd3fc; border: 1px solid rgba(14,165,233,0.22); }
+.chip-green  { background: rgba(34,197,94,0.14);   color: #86efac; border: 1px solid rgba(34,197,94,0.22); }
+.chip-red    { background: rgba(248,113,113,0.14); color: #fca5a5; border: 1px solid rgba(248,113,113,0.22); }
+
+/* ── Scrollbar ─────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar       { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.10); border-radius: 9999px; }
