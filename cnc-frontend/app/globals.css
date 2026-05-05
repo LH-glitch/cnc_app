@@ -23,12 +23,24 @@
 /* ── Base ──────────────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
 
-html, body {
+html {
   height: 100%;
+}
+
+body {
+  min-height: 100%;
   background: var(--bg-deep);
   color: var(--text-primary);
   font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+/* Content area to the right of the sidebar */
+.page-content {
+  flex: 1;
+  min-width: 0;
+  min-height: 100vh;
+  overflow-x: hidden;
 }
 
 /* Ambient gradient canvas */
@@ -60,7 +72,7 @@ body::before {
   border-radius: 10px;
 }
 
-/* ── Glow button ───────────────────────────────────────────────────────────── */
+/* ── Glow button (purple/blue — Slicer) ────────────────────────────────────── */
 .btn-glow {
   background: linear-gradient(135deg, var(--accent-from), var(--accent-to));
   color: #fff;
@@ -76,6 +88,34 @@ body::before {
 }
 .btn-glow:active:not(:disabled) { transform: translateY(0); opacity: 0.88; }
 .btn-glow:disabled               { opacity: 0.38; cursor: not-allowed; }
+
+/* ── Glow button (pink/purple — Photo → DXF) ───────────────────────────────── */
+.btn-glow-pink {
+  background: linear-gradient(135deg, #ec4899, #a855f7);
+  color: #fff;
+  font-weight: 600;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: box-shadow 0.2s, transform 0.12s, opacity 0.15s;
+}
+.btn-glow-pink:hover:not(:disabled) {
+  box-shadow: 0 0 28px 6px rgba(236, 72, 153, 0.45);
+  transform: translateY(-1px);
+}
+.btn-glow-pink:active:not(:disabled) { transform: translateY(0); opacity: 0.88; }
+.btn-glow-pink:disabled               { opacity: 0.38; cursor: not-allowed; }
+
+/* ── Success button state (both variants) ──────────────────────────────────── */
+.btn-success {
+  background: linear-gradient(135deg, rgba(34,197,94,0.7), rgba(16,163,74,0.7));
+  color: #bbf7d0;
+  font-weight: 600;
+  border: none;
+  border-radius: 10px;
+  cursor: default;
+  pointer-events: none;
+}
 
 /* ── Ghost button ──────────────────────────────────────────────────────────── */
 .btn-ghost {
@@ -175,6 +215,39 @@ body::before {
 .chip-green  { background: rgba(34,197,94,0.14);   color: #86efac; border: 1px solid rgba(34,197,94,0.22); }
 .chip-red    { background: rgba(248,113,113,0.14); color: #fca5a5; border: 1px solid rgba(248,113,113,0.22); }
 
+/* ── Range sliders ─────────────────────────────────────────────────────────── */
+.range-dark {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.10);
+  outline: none;
+  cursor: pointer;
+}
+.range-dark::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+  cursor: pointer;
+  box-shadow: 0 0 6px rgba(124, 58, 237, 0.55);
+  transition: box-shadow 0.15s;
+}
+.range-dark::-webkit-slider-thumb:hover {
+  box-shadow: 0 0 10px rgba(124, 58, 237, 0.80);
+}
+.range-dark::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+  cursor: pointer;
+}
+
 /* ── Scrollbar ─────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar       { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -183,6 +256,16 @@ body::before {
 /* ── Keyframes ─────────────────────────────────────────────────────────────── */
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+@keyframes scanDown {
+  0%   { top: -12%; }
+  100% { top: 112%; }
+}
+
+@keyframes nodeFlicker {
+  0%, 100% { opacity: 0; transform: scale(0.4); }
+  50%       { opacity: 1; transform: scale(1);   }
 }
 
 @keyframes pulseDot {
@@ -195,14 +278,52 @@ body::before {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes cardEntrance {
+  from { opacity: 0; transform: translateY(36px) scale(0.95); }
+  to   { opacity: 1; transform: translateY(0)    scale(1);    }
+}
+
+@keyframes entranceHeader {
+  from { opacity: 0; transform: translateY(-18px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes logoPulse {
+  0%, 100% { box-shadow: 0 0 40px rgba(124,58,237,0.45), 0 0 80px rgba(124,58,237,0.15), inset 0 1px 0 rgba(255,255,255,0.12); }
+  50%       { box-shadow: 0 0 65px rgba(124,58,237,0.70), 0 0 130px rgba(14,165,233,0.25), inset 0 1px 0 rgba(255,255,255,0.12); }
+}
+
+@keyframes slowOrb {
+  0%, 100% { transform: translate(0,   0)    scale(1);    }
+  33%       { transform: translate(30px,-20px) scale(1.06); }
+  66%       { transform: translate(-20px,14px) scale(0.94); }
+}
+
+/* ── Reduced-motion: kill all CSS animations & transitions ────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 /* ── Responsive: stack panels below 860px ─────────────────────────────────── */
 @media (max-width: 860px) {
-  /* The two-column flex container */
-  .two-col {
-    flex-direction: column;
-  }
-  /* Left panel goes full width */
-  .two-col > *:first-child {
-    width: 100% !important;
-  }
+  .two-col { flex-direction: column; }
+  .two-col > *:first-child { width: 100% !important; }
+}
+
+/* ── Entrance page tool grid ────────────────────────────────────────────────── */
+.entrance-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  width: 100%;
+}
+@media (max-width: 860px) {
+  .entrance-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 520px) {
+  .entrance-grid { grid-template-columns: 1fr; gap: 10px; }
 }

@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c ':*)"
+      "Bash(python -c ':*)",
+      "Bash(node node_modules/typescript/bin/tsc --noEmit)",
+      "Bash(pip install *)",
+      "Bash(python -c \"from skimage import feature, morphology, measure; import PIL; print\\('All imports OK'\\)\")",
+      "Bash(npm run *)",
+      "Bash(npx tsc *)",
+      "Bash(python -m py_compile api.py)",
+      "Bash(npm install *)"
     ]
   }
 }

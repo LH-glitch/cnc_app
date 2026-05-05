@@ -476,6 +476,2782 @@ async def health():
     return {'status': 'ok', 'version': app.version}
 
 
+# ── Photo → DXF ──────────────────────────────────────────────────────────────
+
+import base64
+import io as _io
+
+import numpy as _np
+from PIL import Image as _PIL, ImageFilter as _PILFilter
+from skimage import (
+    measure as _sk_measure, feature as _sk_feature, morphology as _sk_morph,
+    filters as _sk_filters, exposure as _sk_exp, restoration as _sk_rest,
+)
+
+
+def _rdp(points: "_np.ndarray", epsilon: float) -> list:
+    """Iterative Ramer–Douglas–Peucker simplification. Returns sorted index list."""
+    n = len(points)
+    if n <= 2:
+        return list(range(n))
+    stack: list = [(0, n - 1)]
+    keep: set = {0, n - 1}
+    while stack:
+        s, e = stack.pop()
+        if e - s <= 1:
+            continue
+        seg = points[e] - points[s]
+        seg_len_sq = float(_np.dot(seg, seg))
+        mid = points[s + 1:e]
+        if seg_len_sq < 1e-12:
+            dists = _np.linalg.norm(mid - points[s], axis=1)
+        else:
+            t = _np.clip(_np.dot(mid - points[s], seg) / seg_len_sq, 0.0, 1.0)
+            dists = _np.linalg.norm(mid - (points[s] + _np.outer(t, seg)), axis=1)
+        mi = int(_np.argmax(dists))
+        mg = s + 1 + mi
+        if dists[mi] > epsilon:
+            keep.add(mg)
+            stack.append((s, mg))
+            stack.append((mg, e))
+    return sorted(keep)
+
+
+def _contour_perimeter(c: "_np.ndarray") -> float:
+    """Arc length of a polyline in pixels."""
+    diffs = _np.diff(c, axis=0)
+    return float(_np.sum(_np.linalg.norm(diffs, axis=1)))
+
+
+def _adaptive_rdp(c: "_np.ndarray", base_eps: float) -> list:
+    """
+    RDP with curvature-adaptive epsilon.
+    Splits the contour at high-turn vertices, runs standard RDP on each
+    inter-split segment — tight epsilon for curved regions, loose for
+    near-straight runs.  Preserves arc detail while aggressively simplifying
+    long straight edges.
+    """
+    n = len(c)
+    if n <= 3:
+        return _rdp(c, base_eps)
+
+    v1 = c[1:-1] - c[:-2]
+    v2 = c[2:]   - c[1:-1]
+    l1 = _np.linalg.norm(v1, axis=1)
+    l2 = _np.linalg.norm(v2, axis=1)
+    valid = (l1 > 1e-9) & (l2 > 1e-9)
+    denom = _np.where(valid, l1 * l2, 1.0)
+    cos_a = _np.where(valid, _np.einsum('ij,ij->i', v1, v2) / denom, 1.0)
+    angles = _np.arccos(_np.clip(cos_a, -1.0, 1.0))  # shape (n-2,), radians
+
+    # Anchor the path at every vertex whose turn angle exceeds ~26°
+    SPLIT_ANGLE = 0.45
+    splits = [0] + [i + 1 for i in range(len(angles)) if angles[i] > SPLIT_ANGLE] + [n - 1]
+    splits = sorted(set(splits))
+
+    keep: set = set(splits)
+    for k in range(len(splits) - 1):
+        s, e = splits[k], splits[k + 1]
+        if e - s <= 1:
+            continue
+        seg      = c[s:e + 1]
+        seg_angs = angles[s:e - 1]
+        mean_ang = float(seg_angs.mean()) if len(seg_angs) > 0 else 0.0
+        if mean_ang > 0.35:
+            eps = base_eps * 0.45      # curved — preserve detail
+        elif mean_ang > 0.12:
+            eps = base_eps * 0.85      # gently curved
+        else:
+            eps = base_eps * 1.80      # near-straight — simplify freely
+        keep.update(s + idx for idx in _rdp(seg, eps))
+
+    return sorted(keep)
+
+
+def _encode_png(arr_uint8: "_np.ndarray") -> str:
+    """Encode a uint8 grayscale or RGB numpy array as a base64 PNG data-URI."""
+    mode = 'L' if arr_uint8.ndim == 2 else 'RGB'
+    buf = _io.BytesIO()
+    _PIL.fromarray(arr_uint8, mode=mode).save(buf, format='PNG', optimize=True)
+    return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+
+
+def _analyze_image(arr: "_np.ndarray") -> dict:
+    """Classify image type and recommend a tracing mode."""
+    edges = _sk_feature.canny(arr, sigma=2.0)
+    edge_density = float(edges.mean())
+
+    p5  = float(_np.percentile(arr, 5))
+    p95 = float(_np.percentile(arr, 95))
+    contrast = p95 - p5
+
+    hist, _ = _np.histogram(arr.ravel(), bins=16, range=(0.0, 1.0))
+    total      = float(hist.sum())
+    dark_frac  = float(hist[:3].sum())  / total
+    light_frac = float(hist[13:].sum()) / total
+    mid_frac   = 1.0 - dark_frac - light_frac
+
+    if edge_density > 0.07:
+        image_type       = 'line_art'
+        recommended_mode = 'stroke'
+        description      = 'High edge density — likely a sketch, pen drawing, or line art.'
+        recommendation   = 'High-Fidelity Stroke extracts each drawn stroke as one continuous centerline path — ideal for this type of image.'
+        artistic         = 'Accurate Trace works too; Contour Art turns the drawing into topographic bands with a stylized effect.'
+    elif contrast > 0.65 and mid_frac < 0.35:
+        image_type       = 'silhouette'
+        recommended_mode = 'accurate'
+        description      = 'High contrast with clear dark/light separation — silhouette or bold graphic.'
+        recommendation   = 'Accurate Trace extracts clean outer edges and shape boundaries with minimal noise.'
+        artistic         = 'Contour Art adds inner topographic layers revealing subtle tone variation within the shape.'
+    elif contrast > 0.45 and edge_density > 0.025:
+        image_type       = 'logo'
+        recommended_mode = 'accurate'
+        description      = 'Crisp edges and moderate contrast — likely a logo or graphic design.'
+        recommendation   = 'Accurate Trace preserves the original geometry with faithful vector outlines.'
+        artistic         = 'Contour Art gives the graphic a carved-relief look with concentric layer bands.'
+    else:
+        image_type       = 'photo'
+        recommended_mode = 'contour_art'
+        description      = 'Continuous-tone image — likely a photograph or portrait.'
+        recommendation   = 'Contour Art transforms tonal depth into topographic lines, like a relief map of the scene.'
+        artistic         = 'Each band represents a brightness slice — more levels means finer tonal detail.'
+
+    return {
+        'image_type':        image_type,
+        'recommended_mode':  recommended_mode,
+        'description':       description,
+        'recommendation':    recommendation,
+        'artistic_description': artistic,
+        'edge_density':      round(edge_density, 4),
+        'contrast':          round(contrast, 3),
+        'param_hints':       {},
+    }
+
+
+# Keyword sets for prompt-based override
+_KW_STROKE   = {'face', 'portrait', 'sketch', 'ink', 'pen', 'hair', 'stroke', 'fidelity',
+                'fine detail', 'fine details', 'handdrawn', 'hand drawn', 'drawing', 'doodle'}
+_KW_ACCURATE = {'edge', 'cut', 'cnc', 'outline', 'silhouette', 'simple', 'simplif',
+                'laser', 'clean', 'minimal', 'bold', 'logo'}
+_KW_CONTOUR  = {'contour', 'artistic', 'level', 'tonal', 'topograph', 'depth', 'relief',
+                'layers', 'styliz'}
+_KW_HALFTONE = {'dot', 'halftone', 'circle', 'drill', 'hole', 'stipple', 'pointilism',
+                'pointillism', 'screen', 'engrav', 'dots', 'circles'}
+
+
+def _apply_prompt_override(result: dict, prompt: str) -> dict:
+    """Adjust analysis result based on user's free-text intent description."""
+    p = prompt.lower()
+    hints: dict = {}
+
+    # Mode override — check specificity order: halftone > stroke > accurate > contour
+    if any(kw in p for kw in _KW_HALFTONE):
+        result['recommended_mode'] = 'halftone'
+        result['recommendation']   = 'Your description suggests Dot / Halftone style — maps brightness to circle size.'
+    elif any(kw in p for kw in _KW_STROKE):
+        result['recommended_mode'] = 'stroke'
+        result['recommendation']   = 'Your description suggests High-Fidelity Stroke — follows each drawn line faithfully.'
+    elif any(kw in p for kw in _KW_ACCURATE):
+        result['recommended_mode'] = 'accurate'
+        result['recommendation']   = 'Your description suggests Accurate Trace — clean edges for CNC or laser cutting.'
+    elif any(kw in p for kw in _KW_CONTOUR):
+        result['recommended_mode'] = 'contour_art'
+        result['recommendation']   = 'Your description suggests Contour Art — tonal depth mapped to layered bands.'
+
+    # Parameter hints — independent of mode detection
+    if any(kw in p for kw in ('simplif', 'simple', 'clean', 'minimal', 'cnc cut', 'laser cut')):
+        hints['simplify']    = 8
+        hints['min_length']  = 25
+    if any(kw in p for kw in ('fine detail', 'fine details', 'detailed', 'all detail', 'keep detail')):
+        hints['simplify']    = 2
+        hints['min_length']  = 5
+        hints['sensitivity'] = 7
+    if any(kw in p for kw in ('outer contour', 'outline only', 'silhouette only', 'contour only')):
+        hints['min_length']  = 50
+        hints['simplify']    = 6
+    if any(kw in p for kw in ('artistic', 'styliz', 'creative')):
+        hints['sensitivity'] = 8
+
+    if hints:
+        result['param_hints'] = hints
+    return result
+
+
+def _halftone_grid(
+    arr:        "_np.ndarray",  # float [0,1] grayscale, dark=subject
+    density:    int   = 30,     # grid cells along the longer axis
+    min_radius: float = 0.5,    # min circle radius in image pixels
+    max_radius: float = 8.0,    # max circle radius in image pixels
+    contrast:   float = 1.5,    # contrast multiplier before mapping
+    invert:     bool  = False,  # swap bright/dark mapping
+    gamma:      float = 0.8,    # gamma < 1 lifts shadow detail before mapping
+) -> list:
+    """
+    Divide image into a grid; map mean cell brightness → circle radius.
+    Darker cells → larger circles (more ink / more material removed).
+    Returns list of [center_row, center_col, radius] in image pixel coords.
+    """
+    h, w = arr.shape
+
+    # Gamma correction: lifts shadow detail so dark mid-tones map to
+    # distinguishable radii instead of collapsing near max_radius.
+    arr_g = _np.clip(arr, 1e-6, 1.0) ** gamma
+
+    # Contrast boost (clip to [0,1])
+    mid     = float(_np.median(arr_g))
+    boosted = _np.clip((arr_g - mid) * contrast + mid, 0.0, 1.0)
+    if invert:
+        boosted = 1.0 - boosted
+
+    # Soft edge-proximity map: cells near structural edges get a slight radius
+    # boost so image outlines stay readable at any density setting.
+    edge_map  = _sk_feature.canny(arr, sigma=1.5).astype(float)
+    edge_soft = _sk_filters.gaussian(edge_map, sigma=max(1.5, max(w, h) / (density * 4)))
+
+    # Grid cell size — density = cells along the LONGER axis
+    cell   = max(w, h) / density
+    rows   = max(1, round(h / cell))
+    cols   = max(1, round(w / cell))
+    cell_h = h / rows
+    cell_w = w / cols
+    r_span = max_radius - min_radius
+
+    circles: list = []
+    for gr in range(rows):
+        for gc in range(cols):
+            r0 = int(gr * cell_h);  r1 = min(h, int((gr + 1) * cell_h))
+            c0 = int(gc * cell_w);  c1 = min(w, int((gc + 1) * cell_w))
+            cell_px = boosted[r0:r1, c0:c1]
+            if cell_px.size == 0:
+                continue
+            brightness = float(cell_px.mean())
+            # Non-linear (power 0.7) radius mapping: expands mid-tone discrimination
+            # compared to the linear map, giving finer dot-size variation in greys.
+            radius = min_radius + (1.0 - brightness) ** 0.7 * r_span
+            # Edge proximity boost: up to +12 % of radius range near strong edges
+            cr_i = min(h - 1, int((r0 + r1) * 0.5))
+            cc_i = min(w - 1, int((c0 + c1) * 0.5))
+            radius = min(max_radius, radius + float(edge_soft[cr_i, cc_i]) * r_span * 0.12)
+            if radius > min_radius * 0.3:
+                circles.append([
+                    round((r0 + r1) * 0.5, 2),
+                    round((c0 + c1) * 0.5, 2),
+                    round(radius, 3),
+                ])
+
+    return circles
+
+
+def _chaikin(pts: "_np.ndarray", iters: int = 1) -> "_np.ndarray":
+    """Chaikin corner-cutting: smooths polyline curves while preserving endpoints."""
+    for _ in range(iters):
+        if len(pts) < 3:
+            break
+        new_pts = [pts[0]]
+        for i in range(len(pts) - 1):
+            new_pts.append(0.75 * pts[i] + 0.25 * pts[i + 1])
+            new_pts.append(0.25 * pts[i] + 0.75 * pts[i + 1])
+        new_pts.append(pts[-1])
+        pts = _np.array(new_pts)
+    return pts
+
+
+_SEG_PALETTE = [
+    (255,  80,  80), ( 80, 200,  80), ( 80, 120, 255), (255, 200,   0),
+    (255, 100, 200), (  0, 220, 220), (200, 120, 255), (  0, 200, 140),
+    (255, 160,  40), (160, 255,  80), ( 80, 200, 255), (255,  80, 160),
+]
+
+
+def _render_paths_img(height: int, width: int, path_list: list) -> str:
+    """Render pixel-coordinate paths into a colour PNG data-URI (diagnostic)."""
+    canvas = _np.zeros((height, width, 3), dtype=_np.uint8)
+    for i, path in enumerate(path_list):
+        if not path:
+            continue
+        col = _np.array(_SEG_PALETTE[i % len(_SEG_PALETTE)], dtype=_np.uint8)
+        rs  = _np.clip([int(p[0]) for p in path], 0, height - 1)
+        cs  = _np.clip([int(p[1]) for p in path], 0, width  - 1)
+        canvas[rs, cs] = col
+    return _encode_png(canvas)
+
+
+def _hifi_stroke_paths(
+    arr: "_np.ndarray",
+    sensitivity: float,
+    min_arc: int,
+    simplify_eps: float,
+) -> dict:
+    """
+    High-Fidelity Line Art stroke tracer.
+    Optimised for sketch portraits, pen/ink drawings, overlapping flowing lines.
+
+    Pipeline
+    --------
+    1.  CLAHE contrast enhancement (faint strokes become visible)
+    2.  Bilateral edge-preserving denoise (smooth noise, keep stroke edges sharp)
+    3.  Sauvola adaptive binarisation ∪ global Otsu (thin AND bold strokes)
+    4.  Morphological cleanup
+    5.  Skeletonisation to 1-px centrelines
+    6.  Direction-aware pixel graph construction (segment extraction)
+    7.  Optimal junction pairing — crossing disambiguation via exhaustive search
+        for n≤4 branches, greedy otherwise
+    8.  Global stroke assembly: follow pairing decisions end-to-end
+    9.  Two-pass gap bridging (direction + distance compatible endpoints)
+    10. Very gentle RDP + two-pass Chaikin smoothing
+
+    Returns a dict compatible with _stroke_paths_v2 plus 'n_crossings'.
+    """
+    import math as _math
+
+    h, w = arr.shape
+
+    # ── 1. CLAHE ──────────────────────────────────────────────────────────────
+    enhanced   = _sk_exp.equalize_adapthist(arr, clip_limit=0.015)
+    cleaned_b64 = _encode_png((_np.clip(enhanced, 0, 1) * 255).astype(_np.uint8))
+
+    # ── 2. Bilateral edge-preserving denoise ──────────────────────────────────
+    sigma_sp = max(0.5, 1.8 - (sensitivity - 1.0) * 0.12)
+    denoised = _sk_rest.denoise_bilateral(
+        enhanced.astype(float), sigma_color=0.10,
+        sigma_spatial=sigma_sp, channel_axis=None,
+    )
+
+    # ── 3. Sauvola ∪ Otsu binarisation ───────────────────────────────────────
+    k_sauv = max(0.04, 0.30 - (sensitivity - 1.0) * 0.029)
+    win    = int(max(15, min(51, (h + w) // 55)) | 1)
+    t_sauv  = _sk_filters.threshold_sauvola(denoised, window_size=win, k=k_sauv)
+    b_sauv  = denoised < t_sauv
+    try:
+        t_otsu = _sk_filters.threshold_otsu(denoised)
+    except Exception:
+        t_otsu = 0.5
+    b_otsu  = denoised < (t_otsu + (sensitivity - 5.5) * -0.025)
+    binary  = b_sauv | b_otsu
+
+    # ── 4. Morphological cleanup ──────────────────────────────────────────────
+    min_blob = max(3, min_arc // 10)
+    binary   = _sk_morph.remove_small_objects(binary.astype(bool), max_size=max(0, min_blob - 1))
+    binary   = _sk_morph.closing(binary, _sk_morph.disk(1))
+    binary   = _sk_morph.opening(binary, _sk_morph.disk(1))
+    binary_b64 = _encode_png((binary.astype(_np.uint8)) * 255)
+
+    # ── 5. Skeletonise ────────────────────────────────────────────────────────
+    skel = _sk_morph.skeletonize(binary)
+
+    # Spur pruning via distance transform: skeleton pixels in regions where the
+    # original stroke is thinner than ~1 px are feathered-edge artefacts or
+    # diagonal staircase noise — remove them before building the pixel graph.
+    from scipy.ndimage import distance_transform_edt as _dte
+    dt     = _dte(binary)
+    min_dt = max(0.5, 0.85 - (sensitivity - 5.0) * 0.04)
+    skel   = skel & (dt >= min_dt)
+
+    skel_b64      = _encode_png((skel.astype(_np.uint8)) * 255)
+    ys, xs        = _np.where(skel)
+    total_skel_px = int(len(ys))
+
+    _empty = dict(
+        paths=[], cleaned=cleaned_b64, binary=binary_b64, skeleton=skel_b64,
+        segments=cleaned_b64, merged=cleaned_b64, n_raw_segments=0,
+        n_merges=0, n_bridges=0, n_discarded=0, n_crossings=0,
+        coverage_pct=0.0, avg_stroke_len=0.0, total_skel_px=total_skel_px,
+    )
+    if total_skel_px == 0:
+        return _empty
+
+    pix_set: set = set(zip(ys.tolist(), xs.tolist()))
+
+    def nbrs8(r: int, c: int) -> list:
+        return [(r + dr, c + dc)
+                for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+                if (dr, dc) != (0, 0) and (r + dr, c + dc) in pix_set]
+
+    # ── 6. Pixel graph ────────────────────────────────────────────────────────
+    degree   = {p: len(nbrs8(*p)) for p in pix_set}
+    node_set = {p for p, d in degree.items() if d != 2}
+
+    # Extract segments: chains of degree-2 pixels between node pixels
+    visited  = set(node_set)
+    raw_segs: list = []       # (node_a, node_b, [pixels...])
+
+    for sn in node_set:
+        for nb in nbrs8(*sn):
+            if nb in visited:
+                continue
+            chain = [sn, nb]
+            visited.add(nb)
+            prev, cur = sn, nb
+            while True:
+                cands = [p for p in nbrs8(*cur) if p != prev]
+                nds   = [p for p in cands if p in node_set]
+                d2s   = [p for p in cands if p not in node_set and p not in visited]
+                if nds:
+                    chain.append(nds[0]); break
+                elif d2s:
+                    nxt = d2s[0]; visited.add(nxt)
+                    chain.append(nxt); prev, cur = cur, nxt
+                else:
+                    break
+            end = chain[-1] if chain[-1] in node_set else cur
+            if len(chain) >= 2:
+                raw_segs.append((sn, end, chain))
+
+    # Direct node-to-node edges (adjacent junction pixels have no degree-2 bridge,
+    # so they are skipped by the chain tracer above — add them explicitly so the
+    # junction collapser can later identify and collapse crossing diamonds).
+    _direct_seen: set = set()
+    for sn in node_set:
+        for nb in nbrs8(*sn):
+            if nb in node_set:
+                key = (sn, nb) if sn < nb else (nb, sn)
+                if key not in _direct_seen:
+                    _direct_seen.add(key)
+                    raw_segs.append((sn, nb, [sn, nb]))
+
+    # Isolated loops (no junction nodes in cycle)
+    for p in pix_set:
+        if p not in visited:
+            visited.add(p); loop = [p]; prev, cur = None, p
+            while True:
+                cands = [nb for nb in nbrs8(*cur) if nb != prev and nb not in visited]
+                if not cands:
+                    break
+                nxt = cands[0]; visited.add(nxt)
+                loop.append(nxt); prev, cur = cur, nxt
+            if len(loop) >= 2:
+                loop.append(loop[0])
+                raw_segs.append((loop[0], loop[0], loop))
+
+    segs_b64 = _render_paths_img(h, w, [s[2] for s in raw_segs])
+
+    # ── 6b. Junction bridge collapsing ────────────────────────────────────────
+    # At stroke crossings the skeleton produces a 2–6 px "diamond" of junction
+    # pixels connected by very short segments.  These fragment what should be a
+    # clean X-crossing into many 3-branch nodes, each seeing only a partial
+    # picture of the crossing.  Collapsing those short inter-junction segments
+    # via union-find reduces the cluster to one virtual super-node so the
+    # optimal pairing sees all four arms at once.
+    J_THRESH = 5  # px: junction-to-junction segments ≤ this length are collapsed
+
+    j_par: dict = {n: n for n in node_set}
+
+    def _jfind(x):
+        root = x
+        while j_par.get(root, root) != root:
+            root = j_par[root]
+        # Path compression
+        while j_par.get(x, x) != root:
+            j_par[x], x = root, j_par[x]
+        return root
+
+    def _junion(a, b):
+        ra, rb = _jfind(a), _jfind(b)
+        if ra != rb:
+            j_par[ra] = rb
+
+    collapse_idx: set = set()
+    for i, (a, b, pix) in enumerate(raw_segs):
+        if a == b or a not in node_set or b not in node_set:
+            continue
+        if degree.get(a, 0) < 3 or degree.get(b, 0) < 3:
+            continue
+        if len(pix) <= J_THRESH + 2:
+            _junion(a, b)
+            collapse_idx.add(i)
+
+    # Remap segment endpoints to their virtual junction roots; drop intra-cluster segs
+    raw_segs_r: list = []
+    for i, (a, b, pix) in enumerate(raw_segs):
+        if i in collapse_idx:
+            continue
+        va = _jfind(a) if a in node_set else a
+        vb = _jfind(b) if b in node_set else b
+        if va == vb and a in node_set and b in node_set:
+            continue   # intra-cluster bridge — drop
+        raw_segs_r.append((va, vb, pix))
+    raw_segs = raw_segs_r
+    n_raw = len(raw_segs)
+
+    # ── 7. Optimal junction pairing (crossing disambiguation) ─────────────────
+    LOOK = 15  # pixels ahead for direction estimation (wider = better for curves)
+
+    def outdir(pixels: list, from_end: int) -> tuple:
+        """Unit vector pointing FROM pixels[from_end] INTO the segment."""
+        pts = pixels if from_end == 0 else list(reversed(pixels))
+        n   = min(LOOK, len(pts) - 1)
+        if n == 0:
+            return (0.0, 0.0)
+        dr, dc = pts[n][0] - pts[0][0], pts[n][1] - pts[0][1]
+        L = _math.hypot(dr, dc)
+        return (dr / L, dc / L) if L > 1e-9 else (0.0, 0.0)
+
+    # Build node_adj from remapped segments (virtual node IDs as keys)
+    all_vnodes: set = set()
+    for va, vb, _ in raw_segs:
+        all_vnodes.add(va)
+        if va != vb:
+            all_vnodes.add(vb)
+    node_adj: dict = {n: [] for n in all_vnodes}
+    for i, (a, b, pix) in enumerate(raw_segs):
+        da = outdir(pix, 0)
+        db = outdir(pix, -1)
+        node_adj[a].append((i, b, da))
+        if a != b:
+            node_adj[b].append((i, a, db))
+
+    def ap_score(d1: tuple, d2: tuple) -> float:
+        """Anti-parallel score: +1 = perfectly straight through, -1 = U-turn."""
+        return -(d1[0] * d2[0] + d1[1] * d2[1])
+
+    def best_pairing(branches: list) -> list:
+        """
+        Optimal pairing of branches at a junction for maximum direction continuity.
+        branches: [(seg_idx, other_node, outdir), ...]
+        Returns: [(seg_a, seg_b), ...] pairs to join through this node.
+        Only pairs where individual ap_score > -0.17 (~100° angle) are included.
+        """
+        n = len(branches)
+        if n < 2:
+            return []
+
+        def S(i: int, j: int) -> float:
+            return ap_score(branches[i][2], branches[j][2])
+
+        if n == 2:
+            # Accept if the two branches form an angle ≤ ~110°
+            return [(branches[0][0], branches[1][0])] if S(0, 1) > -0.35 else []
+
+        if n == 3:
+            opts = [(S(i, j), branches[i][0], branches[j][0])
+                    for i in range(3) for j in range(i + 1, 3)]
+            best = max(opts, key=lambda x: x[0])
+            return [(best[1], best[2])] if best[0] > -0.17 else []
+
+        if n == 4:
+            # All 3 perfect matchings; only keep pairs whose individual score > -0.17
+            m0 = [(branches[i][0], branches[j][0]) for i, j in [(0,1),(2,3)] if S(i,j) > -0.17]
+            m1 = [(branches[i][0], branches[j][0]) for i, j in [(0,2),(1,3)] if S(i,j) > -0.17]
+            m2 = [(branches[i][0], branches[j][0]) for i, j in [(0,3),(1,2)] if S(i,j) > -0.17]
+            t0 = sum(S(i,j) for i,j in [(0,1),(2,3)] if S(i,j) > -0.17)
+            t1 = sum(S(i,j) for i,j in [(0,2),(1,3)] if S(i,j) > -0.17)
+            t2 = sum(S(i,j) for i,j in [(0,3),(1,2)] if S(i,j) > -0.17)
+            return max([(t0, m0), (t1, m1), (t2, m2)], key=lambda x: x[0])[1]
+
+        # n ≥ 5: greedy by score, only keep pairs above angle threshold
+        pairs: list = []
+        used  = [False] * n
+        cands = sorted([(S(i, j), i, j)
+                        for i in range(n) for j in range(i + 1, n)],
+                       key=lambda x: -x[0])
+        for s, i, j in cands:
+            if s <= -0.17:
+                break
+            if not used[i] and not used[j]:
+                pairs.append((branches[i][0], branches[j][0]))
+                used[i] = used[j] = True
+        return pairs
+
+    # Count crossings from effective degrees (after junction collapsing)
+    n_crossings = sum(1 for brs in node_adj.values() if len(brs) >= 3)
+
+    # continuation[(seg_idx, junction_node)] = next_seg_idx
+    cont: dict = {}
+    for node, brs in node_adj.items():
+        if len(brs) < 2:
+            continue
+        for sa, sb in best_pairing(brs):
+            cont[(sa, node)] = sb
+            cont[(sb, node)] = sa
+
+    # ── 8. Global stroke assembly ─────────────────────────────────────────────
+    used_s: set = set()
+    assembled: list = []
+    n_merges = 0
+
+    def orient_seg(seg_idx: int, entry_node) -> tuple:
+        a, b, pix = raw_segs[seg_idx]
+        if a == entry_node:
+            return pix, b
+        return list(reversed(pix)), a
+
+    def trace_stroke(start_i: int, entry_node) -> list:
+        nonlocal n_merges
+        pxs: list = []
+        si, en = start_i, entry_node
+        while si is not None and si not in used_s:
+            used_s.add(si)
+            spix, exit_nd = orient_seg(si, en)
+            pxs = pxs + (spix[1:] if pxs else spix)
+            nxt = cont.get((si, exit_nd))
+            if nxt is not None and nxt not in used_s:
+                n_merges += 1
+                si, en = nxt, exit_nd
+            else:
+                break
+        return pxs
+
+    # Start from true endpoints (effective degree 1) to capture full strokes
+    for node, brs in node_adj.items():
+        if len(brs) == 1:
+            si = brs[0][0]
+            if si not in used_s:
+                s = trace_stroke(si, node)
+                if s:
+                    assembled.append(s)
+
+    # Remaining segments (loops, orphaned pieces)
+    for i in range(len(raw_segs)):
+        if i not in used_s:
+            a = raw_segs[i][0]
+            s = trace_stroke(i, a)
+            if s:
+                assembled.append(s)
+
+    merged_b64 = _render_paths_img(h, w, assembled)
+
+    # ── 9. Two-pass gap bridging ──────────────────────────────────────────────
+    n_bridges = 0
+
+    def ep_dir(s: list, tail: bool) -> tuple:
+        """Direction of stroke at an endpoint."""
+        n = min(LOOK, len(s) - 1)
+        if n == 0:
+            return (0.0, 0.0)
+        if tail:
+            dr, dc = s[-1][0] - s[-1 - n][0], s[-1][1] - s[-1 - n][1]
+        else:
+            dr, dc = s[0][0] - s[n][0], s[0][1] - s[n][1]
+        L = _math.hypot(dr, dc)
+        return (dr / L, dc / L) if L > 1e-9 else (0.0, 0.0)
+
+    for pass_gap, pass_cos in [(50, 0.40), (30, 0.58)]:
+        eps_list = []
+        for i, s in enumerate(assembled):
+            if len(s) < 2:
+                continue
+            eps_list.append((i, False, s[0],  ep_dir(s, False)))
+            eps_list.append((i, True,  s[-1], ep_dir(s, True)))
+
+        consumed: set = set()
+        for ia, (si, tail_a, pa, da) in enumerate(eps_list):
+            if si in consumed:
+                continue
+            best_score, best_ib = -1.0, -1
+            for ib, (sj, tail_b, pb, db) in enumerate(eps_list):
+                if sj == si or sj in consumed or ib == ia:
+                    continue
+                dr, dc = pb[0] - pa[0], pb[1] - pa[1]
+                dist   = _math.hypot(dr, dc)
+                if dist < 1 or dist > pass_gap:
+                    continue
+                dir_ab = (dr / dist, dc / dist)
+                dot_a  =  da[0] * dir_ab[0] + da[1] * dir_ab[1]
+                dot_b  = -db[0] * dir_ab[0] - db[1] * dir_ab[1]
+                if dot_a < pass_cos or dot_b < pass_cos:
+                    continue
+                sc = dot_a + dot_b - dist / pass_gap
+                if sc > best_score:
+                    best_score, best_ib = sc, ib
+
+            if best_ib >= 0:
+                sj, tail_b, pb, db = eps_list[best_ib]
+                sa_px = assembled[si]
+                sb_px = assembled[sj]
+                if tail_a and not tail_b:
+                    assembled[si] = sa_px + sb_px
+                elif tail_a and tail_b:
+                    assembled[si] = sa_px + list(reversed(sb_px))
+                elif not tail_a and tail_b:
+                    assembled[si] = sb_px + sa_px
+                else:
+                    assembled[si] = list(reversed(sb_px)) + sa_px
+                assembled[sj] = []
+                consumed.add(sj)
+                n_bridges += 1
+
+    # ── 10. Filter, RDP, Chaikin ──────────────────────────────────────────────
+    n_discarded = 0
+    covered_px  = 0
+    result: list = []
+    min_len = max(2, min_arc // 10)          # very lenient to preserve fine detail
+    # epsilon ≥ 0.8 eliminates sub-pixel staircase noise from diagonal skeleton lines
+    eps_rdp = max(0.8, simplify_eps / 4.0)
+
+    for s in assembled:
+        if len(s) < 2:
+            continue
+        arc = sum(_math.hypot(s[k+1][0]-s[k][0], s[k+1][1]-s[k][1])
+                  for k in range(len(s)-1))
+        if arc < min_len:
+            n_discarded += 1
+            continue
+        pts  = _np.array(s, dtype=float)
+        idx  = _rdp(pts, eps_rdp)
+        simp = pts[idx]
+        # Two Chaikin passes for long curves (arc > 40 px) gives smoother arcs;
+        # short strokes stay sharp with one pass to avoid over-rounding endpoints.
+        smoothed = _chaikin(simp, iters=2 if arc > 40 else 1)
+        if len(smoothed) >= 2:
+            covered_px += len(s)
+            result.append(smoothed.tolist())
+
+    result.sort(key=lambda p: -len(p))
+    result = result[:3000]   # allow dense portrait detail
+
+    coverage_pct   = round(covered_px / max(total_skel_px, 1) * 100, 1)
+    avg_stroke_len = round(covered_px / max(len(result), 1), 1)
+
+    return dict(
+        paths=result, cleaned=cleaned_b64, binary=binary_b64,
+        skeleton=skel_b64, segments=segs_b64, merged=merged_b64,
+        n_raw_segments=n_raw, n_merges=n_merges, n_bridges=n_bridges,
+        n_discarded=n_discarded, n_crossings=n_crossings,
+        coverage_pct=coverage_pct, avg_stroke_len=avg_stroke_len,
+        total_skel_px=total_skel_px,
+    )
+
+
+def _stroke_paths_v2(
+    arr: "_np.ndarray",   # float [0,1], pre-blurred, dark=stroke
+    sensitivity: float,   # 1–10: higher → more / fainter strokes
+    min_arc: int,         # user-facing min path length (px)
+    simplify_eps: float,  # base RDP epsilon (will be reduced for strokes)
+) -> dict:
+    """
+    Advanced stroke tracer for sketch / line-art images.
+
+    Stages
+    ------
+    1. Normalise + CLAHE contrast enhancement (faint strokes become visible)
+    2. Sauvola adaptive binarisation ∪ global Otsu (captures thin AND bold strokes)
+    3. Morphological cleanup (close 1-px gaps, remove noise blobs)
+    4. Skeletonise → 1-pixel wide centrelines
+    5. Graph construction (segment nodes at junctions and endpoints)
+    6. Two-pass greedy junction merging (tight 25°, then relaxed 40°)
+    7. Two-pass gap bridging (strict 30°/30 px, then relaxed 45°/20 px)
+    8. Lenient length filter (1/4 of user setting) → preserve small details
+    9. Gentle RDP (1/5 of other modes) + 1-iter Chaikin smoothing
+
+    Returns dict with paths, all diagnostic images, and coverage metrics.
+    """
+    h, w = arr.shape
+
+    # ── 1. Normalise + CLAHE ─────────────────────────────────────────────────
+    p2, p98   = float(_np.percentile(arr, 2)), float(_np.percentile(arr, 98))
+    arr_norm  = _np.clip((arr - p2) / max(p98 - p2, 1e-6), 0.0, 1.0)
+    arr_clahe = _sk_exp.equalize_adapthist(arr_norm, clip_limit=0.015)
+    cleaned_b64 = _encode_png((arr_clahe * 255).astype(_np.uint8))
+
+    # ── 2. Binarise ──────────────────────────────────────────────────────────
+    # Sauvola k: higher sensitivity → lower k → more strokes captured
+    k_sauvola = max(0.04, 0.35 - (sensitivity - 1.0) * 0.034)  # 1→0.35, 10→0.04
+    win_size  = int(max(15, min(51, (h + w) // 55)) | 1)        # odd, ≤51
+
+    try:
+        t_sauvola = _sk_filters.threshold_sauvola(arr_clahe, window_size=win_size, k=k_sauvola)
+        binary    = arr_clahe < t_sauvola
+    except Exception:
+        t_sauvola = float(_sk_filters.threshold_otsu(arr_clahe))
+        binary    = arr_clahe < float(t_sauvola)
+
+    # Union with global Otsu: bold strokes are never missed
+    try:
+        t_otsu = float(_sk_filters.threshold_otsu(arr_clahe))
+    except Exception:
+        t_otsu = 0.5
+    binary = binary | (arr_clahe < t_otsu)
+
+    # ── 3. Morphological cleanup ─────────────────────────────────────────────
+    binary   = _sk_morph.closing(binary, _sk_morph.disk(1))
+    min_blob = max(4, min_arc // 8)
+    binary   = _sk_morph.remove_small_objects(binary.astype(bool), max_size=max(0, min_blob - 1))
+    binary_b64 = _encode_png((binary.astype(_np.uint8)) * 255)
+
+    # ── 4. Skeletonise ───────────────────────────────────────────────────────
+    skel     = _sk_morph.skeletonize(binary)
+    skel_b64 = _encode_png((skel.astype(_np.uint8)) * 255)
+
+    ys, xs = _np.where(skel)
+    total_skel_px = int(len(ys))
+    if total_skel_px == 0:
+        empty = skel_b64
+        return {
+            'paths': [], 'cleaned': cleaned_b64, 'binary': binary_b64,
+            'skeleton': empty, 'segments': empty, 'merged': empty,
+            'n_raw_segments': 0, 'n_merges': 0, 'n_bridges': 0,
+            'n_discarded': 0, 'coverage_pct': 0.0,
+            'avg_stroke_len': 0.0, 'total_skel_px': 0,
+        }
+
+    pix_set: set = set(zip(ys.tolist(), xs.tolist()))
+
+    def nbrs8(r: int, c: int) -> list:
+        return [(r + dr, c + dc)
+                for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+                if (dr, dc) != (0, 0) and (r + dr, c + dc) in pix_set]
+
+    deg: dict = {p: len(nbrs8(*p)) for p in pix_set}
+    node_set: set = {p for p, d in deg.items() if d != 2}
+    if not node_set:
+        node_set = {min(pix_set)}
+
+    # ── 5. Graph: trace segments between node pairs ──────────────────────────
+    visited_edges: set = set()
+    raw_segs: list     = []
+
+    for node in sorted(node_set):
+        for nbr in sorted(nbrs8(*node)):
+            ekey = (min(node, nbr), max(node, nbr))
+            if ekey in visited_edges:
+                continue
+            visited_edges.add(ekey)
+            path: list = [node, nbr]
+            prev, cur  = node, nbr
+            while cur not in node_set:
+                cands = [n for n in nbrs8(*cur) if n != prev]
+                if not cands:
+                    break
+                nxt = cands[0]
+                visited_edges.add((min(cur, nxt), max(cur, nxt)))
+                prev, cur = cur, nxt
+                path.append(cur)
+            raw_segs.append(path)
+
+    n_raw    = len(raw_segs)
+    segs_b64 = _render_paths_img(h, w, raw_segs)
+
+    # ── 6. Two-pass junction merging ─────────────────────────────────────────
+    WIN = 16
+
+    def seg_dir(seg: list, at_start: bool, win: int = WIN) -> "_np.ndarray":
+        pts = _np.array(seg[:win] if at_start else seg[-win:], dtype=float)
+        if len(pts) < 2:
+            return _np.zeros(2)
+        v = (pts[-1] - pts[0]) if at_start else (pts[0] - pts[-1])
+        m = float(_np.linalg.norm(v))
+        return v / m if m > 1e-9 else _np.zeros(2)
+
+    segs: list  = [list(s) for s in raw_segs]
+    active: set = set(range(len(segs)))
+    n_merges    = 0
+
+    # Pass 1: tight collinearity (≤25°), pass 2: relaxed (≤40°)
+    for cos_junc in (_np.cos(_np.radians(25)), _np.cos(_np.radians(40))):
+        changed = True
+        while changed:
+            changed = False
+            nm: dict = {}
+            for i in active:
+                s = segs[i]
+                if not s:
+                    continue
+                nm.setdefault(s[0],  []).append((i, True))
+                if len(s) > 1:
+                    nm.setdefault(s[-1], []).append((i, False))
+
+            for node, entries in nm.items():
+                entries = [(i, a) for i, a in entries if i in active]
+                if len(entries) < 2:
+                    continue
+                best_cos, best_pair = cos_junc, None
+                for a in range(len(entries)):
+                    i, ia = entries[a]
+                    di = seg_dir(segs[i], ia)
+                    for b in range(a + 1, len(entries)):
+                        j, ja = entries[b]
+                        dj = seg_dir(segs[j], ja)
+                        cv = float(-_np.dot(di, dj))
+                        if cv > best_cos:
+                            best_cos, best_pair = cv, (a, b)
+                if best_pair is None:
+                    continue
+                a_idx, b_idx = best_pair
+                i, ia = entries[a_idx]
+                j, ja = entries[b_idx]
+                si = segs[i] if not ia else list(reversed(segs[i]))
+                sj = segs[j][1:] if not ja else list(reversed(segs[j]))[1:]
+                segs[i] = si + sj
+                active.discard(j)
+                n_merges += 1
+                changed = True
+                break
+
+    # ── 7. Two-pass gap bridging ─────────────────────────────────────────────
+    n_bridges = 0
+
+    for pass_cos, pass_gap in (
+        (_np.cos(_np.radians(30)), 30),
+        (_np.cos(_np.radians(45)), 20),
+    ):
+        changed = True
+        while changed:
+            changed = False
+            eps_info: list = []
+            for i in active:
+                s = segs[i]
+                if len(s) < 2:
+                    continue
+                eps_info.append((i, True,  _np.array(s[0],  float), seg_dir(s, True)))
+                eps_info.append((i, False, _np.array(s[-1], float), seg_dir(s, False)))
+
+            best_score, best_m = -_np.inf, None
+            for a in range(len(eps_info)):
+                i, ia, pi, di = eps_info[a]
+                di_tail = -di if ia else di
+                for b in range(a + 1, len(eps_info)):
+                    j, ja, pj, dj = eps_info[b]
+                    if i == j:
+                        continue
+                    dj_tail = -dj if ja else dj
+                    gap     = pj - pi
+                    gap_len = float(_np.linalg.norm(gap))
+                    if gap_len < 1.0 or gap_len > pass_gap:
+                        continue
+                    gd      = gap / gap_len
+                    cos_val = min(float(_np.dot(di_tail,  gd)),
+                                  float(_np.dot(dj_tail, -gd)))
+                    if cos_val < pass_cos:
+                        continue
+                    score = cos_val - gap_len / pass_gap * 0.3
+                    if score > best_score:
+                        best_score, best_m = score, (i, ia, j, ja)
+
+            if best_m is None:
+                break
+            i, ia, j, ja = best_m
+            si = segs[i] if not ia else list(reversed(segs[i]))
+            sj = segs[j][1:] if not ja else list(reversed(segs[j]))[1:]
+            segs[i] = si + sj
+            active.discard(j)
+            n_bridges += 1
+            changed = True
+
+    merged_b64 = _render_paths_img(h, w, [segs[i] for i in active])
+
+    # ── 8. Length filter + gentle RDP + Chaikin smoothing ───────────────────
+    eff_min     = max(3, min_arc // 4)          # lenient: keep small real features
+    eps_rdp     = max(0.08, simplify_eps / 5.0) # 5× gentler than other modes
+    n_discarded = 0
+    covered_px  = 0
+    result: list = []
+
+    for i in active:
+        seg = segs[i]
+        if len(seg) < 2:
+            continue
+        pts = _np.array(seg, dtype=float)
+        if _contour_perimeter(pts) < eff_min:
+            n_discarded += 1
+            continue
+        covered_px += len(seg)
+        idx      = _rdp(pts, eps_rdp)
+        simp     = pts[idx]
+        smoothed = _chaikin(simp, iters=1)  # one pass rounds corners gently
+        if len(smoothed) >= 2:
+            result.append(smoothed.tolist())
+
+    result.sort(key=lambda p: -len(p))
+    result = result[:1500]
+
+    coverage_pct   = round(covered_px / max(total_skel_px, 1) * 100, 1)
+    avg_stroke_len = round(covered_px / max(len(result), 1), 1)
+
+    return {
+        'paths':          result,
+        'cleaned':        cleaned_b64,
+        'binary':         binary_b64,
+        'skeleton':       skel_b64,
+        'segments':       segs_b64,
+        'merged':         merged_b64,
+        'n_raw_segments': n_raw,
+        'n_merges':       n_merges,
+        'n_bridges':      n_bridges,
+        'n_discarded':    n_discarded,
+        'coverage_pct':   coverage_pct,
+        'avg_stroke_len': avg_stroke_len,
+        'total_skel_px':  total_skel_px,
+    }
+
+
+# kept for reference — replaced by _stroke_paths_v2
+def _stroke_paths(
+    arr: "_np.ndarray",
+    sensitivity: float,
+    min_arc: int,
+    simplify_eps: float,
+    invert: bool,
+) -> "tuple[str, list]":
+    """
+    Skeleton-based stroke tracer for sketch / line-art images.
+
+    Pipeline:
+      1. Otsu binarize (sensitivity offsets the threshold to include faint lines)
+      2. Remove tiny blobs, close small gaps in strokes
+      3. Skeletonize → 1-pixel wide centerlines
+      4. Build pixel graph (segments between junction/endpoint nodes)
+      5. Greedy junction merging (pair most-collinear edges at every branch)
+      6. Gap bridging (connect nearby compatible open endpoints)
+      7. Filter by arc length + RDP simplification
+
+    Returns (skeleton_b64_image, list_of_simplified_paths).
+    """
+    # ── 1. Binarize ───────────────────────────────────────────────────────────
+    try:
+        t = _sk_filters.threshold_otsu(arr)
+    except Exception:
+        t = 0.5
+    # sensitivity 1–10: higher → lower threshold → more (fainter) strokes included
+    offset = (sensitivity - 5.5) * (-0.04)   # maps 1→+0.18, 10→-0.18
+    binary = (arr < (t + offset))
+    if invert:
+        binary = ~binary
+
+    # ── 2. Morphological cleanup ──────────────────────────────────────────────
+    min_blob = max(6, min_arc // 5)
+    binary   = _sk_morph.remove_small_objects(binary.astype(bool), max_size=min_blob - 1)
+    binary   = _sk_morph.closing(binary, _sk_morph.disk(1))
+
+    # ── 3. Skeletonize ────────────────────────────────────────────────────────
+    skel      = _sk_morph.skeletonize(binary)
+    skel_b64  = _encode_png((skel.astype(_np.uint8)) * 255)
+
+    ys, xs = _np.where(skel)
+    if len(ys) == 0:
+        return skel_b64, []
+
+    pix_set: set = set(zip(ys.tolist(), xs.tolist()))
+
+    def nbrs8(r: int, c: int) -> list:
+        return [(r + dr, c + dc)
+                for dr in (-1, 0, 1) for dc in (-1, 0, 1)
+                if (dr, dc) != (0, 0) and (r + dr, c + dc) in pix_set]
+
+    deg: dict = {p: len(nbrs8(*p)) for p in pix_set}
+    # "Nodes" = pixels that are NOT ordinary pass-through (degree ≠ 2)
+    node_set: set = {p for p, d in deg.items() if d != 2}
+    if not node_set:
+        node_set = {min(pix_set)}
+
+    # ── 4. Trace path segments between node pairs ─────────────────────────────
+    visited_edges: set = set()
+    raw_segs: list     = []
+
+    for node in sorted(node_set):
+        for nbr in sorted(nbrs8(*node)):
+            ekey = (min(node, nbr), max(node, nbr))
+            if ekey in visited_edges:
+                continue
+            visited_edges.add(ekey)
+
+            path: list = [node, nbr]
+            prev, cur = node, nbr
+            while cur not in node_set:
+                cands = [n for n in nbrs8(*cur) if n != prev]
+                if not cands:
+                    break
+                nxt = cands[0]
+                visited_edges.add((min(cur, nxt), max(cur, nxt)))
+                prev, cur = cur, nxt
+                path.append(cur)
+            raw_segs.append(path)
+
+    # ── 5. Greedy junction merging ────────────────────────────────────────────
+    # At each branch node, repeatedly find the most-collinear pair of meeting
+    # segments and fuse them into one long path.  This is the key step that
+    # converts many short fragments into long natural strokes.
+    WIN = 14   # pixels used to estimate direction at each endpoint
+
+    def seg_dir(seg: list, at_start: bool) -> "_np.ndarray":
+        pts = _np.array(seg[:WIN] if at_start else seg[-WIN:], dtype=float)
+        if len(pts) < 2:
+            return _np.zeros(2)
+        v = (pts[-1] - pts[0]) if at_start else (pts[0] - pts[-1])
+        m = float(_np.linalg.norm(v))
+        return v / m if m > 1e-9 else _np.zeros(2)
+
+    segs: list  = [list(s) for s in raw_segs]
+    active: set = set(range(len(segs)))
+    COS_JUNC    = _np.cos(_np.radians(30))   # within 30° → merge at junction
+
+    changed = True
+    while changed:
+        changed = False
+        # Rebuild node→segment map each pass (cheap compared to correctness)
+        nm: dict = {}
+        for i in active:
+            s = segs[i]
+            if not s:
+                continue
+            nm.setdefault(s[0],  []).append((i, True))
+            if len(s) > 1:
+                nm.setdefault(s[-1], []).append((i, False))
+
+        for node, entries in nm.items():
+            entries = [(i, a) for i, a in entries if i in active]
+            if len(entries) < 2:
+                continue
+
+            # Find the pair of segments whose outgoing directions are most anti-parallel
+            # (i.e., they are most nearly collinear through this node)
+            best_cos, best_pair = COS_JUNC, None
+            for a in range(len(entries)):
+                i, ia = entries[a]
+                di = seg_dir(segs[i], ia)
+                for b in range(a + 1, len(entries)):
+                    j, ja = entries[b]
+                    dj = seg_dir(segs[j], ja)
+                    cos_val = float(-_np.dot(di, dj))  # anti-parallel → collinear pass-through
+                    if cos_val > best_cos:
+                        best_cos, best_pair = cos_val, (a, b)
+
+            if best_pair is None:
+                continue
+
+            a_idx, b_idx = best_pair
+            i, ia = entries[a_idx]
+            j, ja = entries[b_idx]
+
+            # Fuse: orient seg_i so its tail is at `node`, then append seg_j's body
+            si = segs[i] if not ia else list(reversed(segs[i]))
+            sj = segs[j][1:] if not ja else list(reversed(segs[j]))[1:]
+            segs[i] = si + sj
+            active.discard(j)
+            changed = True
+            break   # rebuild map and restart
+
+    # ── 6. Gap bridging ───────────────────────────────────────────────────────
+    # Connect open endpoints that are spatially close AND directionally compatible.
+    # This handles strokes that are nearly touching or have tiny gaps after skeletonize.
+    GAP_MAX  = 18                              # max bridge distance in pixels
+    COS_GAP  = _np.cos(_np.radians(35))        # direction alignment threshold
+
+    changed = True
+    while changed:
+        changed = False
+        eps_info: list = []
+        for i in active:
+            s = segs[i]
+            if len(s) < 2:
+                continue
+            eps_info.append((i, True,  _np.array(s[0],  float), seg_dir(s, True)))
+            eps_info.append((i, False, _np.array(s[-1], float), seg_dir(s, False)))
+
+        best_score, best_m = -_np.inf, None
+
+        for a in range(len(eps_info)):
+            i, ia, pi, di = eps_info[a]
+            di_tail = -di if ia else di   # direction leaving this endpoint along the stroke
+
+            for b in range(a + 1, len(eps_info)):
+                j, ja, pj, dj = eps_info[b]
+                if i == j:
+                    continue
+                dj_tail = -dj if ja else dj
+
+                gap_vec = pj - pi
+                gap_len = float(_np.linalg.norm(gap_vec))
+                if gap_len < 1.0 or gap_len > GAP_MAX:
+                    continue
+                gd = gap_vec / gap_len
+
+                # Both tails should be pointing toward each other across the gap
+                cos_i = float(_np.dot(di_tail,  gd))
+                cos_j = float(_np.dot(dj_tail, -gd))
+                cos_val = min(cos_i, cos_j)
+                if cos_val < COS_GAP:
+                    continue
+
+                score = cos_val - gap_len / GAP_MAX * 0.25
+                if score > best_score:
+                    best_score, best_m = score, (i, ia, j, ja)
+
+        if best_m is None:
+            break
+        i, ia, j, ja = best_m
+        si = segs[i] if not ia else list(reversed(segs[i]))
+        sj = segs[j][1:] if not ja else list(reversed(segs[j]))[1:]
+        segs[i] = si + sj
+        active.discard(j)
+        changed = True
+
+    # ── 7. Filter by arc length + RDP simplification ──────────────────────────
+    result: list = []
+    for i in active:
+        seg = segs[i]
+        if len(seg) < 2:
+            continue
+        pts = _np.array(seg, dtype=float)
+        if _contour_perimeter(pts) < min_arc:
+            continue
+        idx        = _rdp(pts, simplify_eps)
+        simplified = pts[idx]
+        if len(simplified) >= 2:
+            result.append(simplified.tolist())
+
+    result.sort(key=lambda p: -len(p))
+    return skel_b64, result[:800]
+
+
+@app.post('/photo-to-dxf/analyze', summary='Analyze image and recommend a tracing mode')
+async def photo_analyze(
+    file:   UploadFile = File(...),
+    prompt: str        = Form('', description='Optional free-text intent from the user'),
+):
+    raw = await file.read()
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(413, 'Image too large (max 20 MB)')
+    try:
+        img = _PIL.open(_io.BytesIO(raw)).convert('L')
+    except Exception as exc:
+        raise HTTPException(400, f'Cannot open image: {exc}')
+
+    w, h = img.size
+    if max(w, h) > 600:
+        sf = 600 / max(w, h)
+        img = img.resize((int(w * sf), int(h * sf)), _PIL.LANCZOS)
+
+    arr    = _np.asarray(img, dtype=float) / 255.0
+    result = _analyze_image(arr)
+    if prompt.strip():
+        result = _apply_prompt_override(result, prompt.strip())
+    return JSONResponse(result)
+
+
+class AiRecommendRequest(BaseModel):
+    image_type:   str
+    edge_density: float
+    contrast:     float
+    prompt:       str = ''
+
+
+@app.post('/ai-recommend', summary='LLM-powered tracing mode recommendation')
+async def ai_recommend(body: AiRecommendRequest):
+    api_key = os.environ.get('OPENAI_API_KEY', '')
+    if not api_key:
+        return JSONResponse({'source': 'none', 'error': 'OPENAI_API_KEY not configured'})
+
+    _SYSTEM = (
+        'You are an expert CNC fabrication assistant. '
+        'Given image analysis data and an optional user intent, recommend the best tracing mode '
+        'from: accurate, contour_art, stroke, halftone.\n'
+        '- accurate: logos, silhouettes, bold line art with clear edges\n'
+        '- contour_art: portraits, landscapes, tonal images with gradients\n'
+        '- stroke: hand-drawn sketches, pen/ink, single-stroke line art\n'
+        '- halftone: portraits or photos that will be engraved as dot patterns\n\n'
+        'Respond ONLY with a JSON object (no markdown) with these keys:\n'
+        '  recommended_mode: string (one of the four modes)\n'
+        '  confidence: number 0.0–1.0\n'
+        '  explanation: string (1–2 sentences, plain language)\n'
+        '  reasoning: string (1 sentence on why this mode fits)\n'
+        '  param_hints: object with optional keys simplify, min_length, sensitivity (numbers)'
+    )
+
+    _USER = (
+        f'Image type: {body.image_type}\n'
+        f'Edge density: {body.edge_density:.3f}\n'
+        f'Contrast: {body.contrast:.3f}\n'
+        f'User intent: {body.prompt or "(none provided)"}'
+    )
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=api_key)
+        resp = await client.chat.completions.create(
+            model='gpt-4o-mini',
+            response_format={'type': 'json_object'},
+            messages=[
+                {'role': 'system', 'content': _SYSTEM},
+                {'role': 'user',   'content': _USER},
+            ],
+            max_tokens=400,
+            temperature=0.3,
+        )
+        raw = resp.choices[0].message.content or '{}'
+        data = json.loads(raw)
+        data['source'] = 'ai'
+        # Ensure required keys exist
+        data.setdefault('recommended_mode', 'accurate')
+        data.setdefault('confidence', 0.5)
+        data.setdefault('explanation', '')
+        data.setdefault('reasoning', '')
+        data.setdefault('param_hints', {})
+        return JSONResponse(data)
+    except Exception as exc:
+        return JSONResponse({'source': 'none', 'error': str(exc)})
+
+
+@app.post('/photo-to-dxf/halftone', summary='Convert image to halftone circle grid')
+async def photo_halftone(
+    file:       UploadFile = File(...),
+    density:    int        = Form(30,   description='Grid cells along longer axis (10–80)'),
+    min_radius: float      = Form(0.5,  description='Minimum circle radius in px'),
+    max_radius: float      = Form(8.0,  description='Maximum circle radius in px'),
+    contrast:   float      = Form(1.5,  description='Contrast boost before mapping (0.5–3.0)'),
+    blur:       float      = Form(1.0,  description='Pre-blur radius (0–5)'),
+    invert:     bool       = Form(False,description='Invert: bright areas → large circles'),
+):
+    raw = await file.read()
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(413, 'Image too large (max 20 MB)')
+    try:
+        img = _PIL.open(_io.BytesIO(raw)).convert('L')
+    except Exception as exc:
+        raise HTTPException(400, f'Cannot open image: {exc}')
+
+    # Resize to max 1400px (same as trace endpoint)
+    w, h = img.size
+    if max(w, h) > 1400:
+        sf = 1400 / max(w, h)
+        img = img.resize((int(w * sf), int(h * sf)), _PIL.LANCZOS)
+        w, h = img.size
+
+    if blur > 0.2:
+        img = img.filter(_PILFilter.GaussianBlur(radius=blur))
+
+    arr = _np.asarray(img, dtype=float) / 255.0
+
+    density    = max(5,   min(100, density))
+    min_radius = max(0.1, min(20.0, min_radius))
+    max_radius = max(min_radius + 0.1, min(50.0, max_radius))
+    contrast   = max(0.1, min(5.0,  contrast))
+
+    circles = _halftone_grid(arr, density, min_radius, max_radius, contrast, invert)
+
+    # Build a preview image: draw filled circles on white canvas
+    import math as _math2
+    canvas = (_np.ones((h, w), dtype=_np.uint8) * 255)
+    for cr, cc, r in circles:
+        ri, ci, ri_px = int(cr), int(cc), max(1, int(r))
+        rr0, rr1 = max(0, ri - ri_px - 1), min(h, ri + ri_px + 2)
+        cc0, cc1 = max(0, ci - ri_px - 1), min(w, ci + ri_px + 2)
+        for rp in range(rr0, rr1):
+            for cp in range(cc0, cc1):
+                if _math2.hypot(rp - cr, cp - cc) <= r:
+                    canvas[rp, cp] = 0
+    preview_b64 = _encode_png(canvas)
+
+    return JSONResponse({
+        'circles':      circles,
+        'preview_image': preview_b64,
+        'n_circles':    len(circles),
+        'image_width':  w,
+        'image_height': h,
+    })
+
+
+class HalftoneExportRequest(BaseModel):
+    circles:      List[List[float]]  # [[row, col, radius], ...]
+    image_width:  int
+    image_height: int
+    scale:        float = 1.0        # mm per pixel
+    filename:     str   = 'halftone.dxf'
+
+
+@app.post('/photo-to-dxf/export-halftone', summary='Export halftone circles as DXF')
+async def export_halftone(body: HalftoneExportRequest, background_tasks: BackgroundTasks):
+    import ezdxf
+
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
+
+    h, s = body.image_height, body.scale
+    for entry in body.circles:
+        if len(entry) < 3:
+            continue
+        row, col, radius = float(entry[0]), float(entry[1]), float(entry[2])
+        x = col    * s
+        y = (h - row) * s   # flip Y so DXF origin is bottom-left
+        r = radius * s
+        if r > 0:
+            msp.add_circle((x, y), radius=r)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    doc.saveas(tmp_path)
+    background_tasks.add_task(os.unlink, tmp_path)
+
+    return FileResponse(
+        tmp_path,
+        media_type='application/octet-stream',
+        filename=body.filename,
+        headers={'Content-Disposition': f'attachment; filename="{body.filename}"'},
+    )
+
+
+@app.post('/photo-to-dxf/trace', summary='Detect vector contours from an image (two modes)')
+async def photo_trace(
+    file:        UploadFile = File(...,   description='Image file (JPG, PNG, BMP, WebP)'),
+    mode:        str        = Form('accurate', description="'accurate' (Canny) or 'contour_art' (iso-contours)"),
+    blur:        float      = Form(1.5,   description='Pre-blur radius 0–5 (denoise)'),
+    sensitivity: float      = Form(5.0,   description='Edge sensitivity 1–10 (accurate) or contour levels (contour_art)'),
+    simplify:    float      = Form(2.0,   description='RDP path simplification 0–15'),
+    min_length:  int        = Form(15,    description='Minimum contour length in pixels 5–80'),
+    invert:      bool       = Form(False, description='Invert (dark subject on light background)'),
+):
+    """
+    Two tracing modes:
+
+    **accurate** — Canny edge detection pipeline:
+      grayscale → blur → Canny → dilation → find_contours → RDP
+
+    **contour_art** — Iso-contour / topographic pipeline:
+      grayscale → blur → find_contours at N evenly-spaced levels → RDP
+      Produces layered topographic-style art; `sensitivity` controls the number of bands.
+    """
+    raw = await file.read()
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(413, 'Image too large (max 20 MB)')
+
+    try:
+        img = _PIL.open(_io.BytesIO(raw)).convert('L')
+    except Exception as exc:
+        raise HTTPException(400, f'Cannot open image: {exc}')
+
+    # ── 1. Resize ────────────────────────────────────────────────────────────
+    w, h = img.size
+    if max(w, h) > 1400:
+        sf = 1400 / max(w, h)
+        img = img.resize((int(w * sf), int(h * sf)), _PIL.LANCZOS)
+        w, h = img.size
+
+    arr = _np.asarray(img, dtype=float) / 255.0
+    if invert:
+        arr = 1.0 - arr
+
+    # ── 2. Pre-process: CLAHE + bilateral edge-preserving denoise ────────────
+    # stroke mode has its own CLAHE + bilateral internally; skip here to avoid
+    # double-processing.  For accurate / contour_art, bilateral replaces the
+    # old Gaussian blur: it smooths noise without smearing edge boundaries,
+    # so subsequent edge detection sees sharper transitions.
+    if mode != 'stroke':
+        arr = _sk_exp.equalize_adapthist(arr, clip_limit=0.018)
+        if blur > 0.2:
+            sigma_sp = max(1.0, blur * 1.8)
+            arr = _sk_rest.denoise_bilateral(
+                arr, sigma_color=0.10, sigma_spatial=sigma_sp, channel_axis=None,
+            )
+
+    cleaned_b64 = _encode_png((_np.clip(arr, 0, 1) * 255).astype(_np.uint8))
+
+    # ── 3. Mode-specific pipeline ────────────────────────────────────────────
+    stroke_meta: dict = {}
+    if mode == 'stroke':
+        # High-Fidelity stroke tracer: optimal junction pairing + global assembly
+        stroke_r    = _hifi_stroke_paths(arr, sensitivity, min_length, simplify * 0.5 + 0.2)
+        cleaned_b64 = stroke_r['cleaned']
+        edges_b64   = stroke_r['skeleton']
+        out         = stroke_r['paths']
+        stroke_meta = {k: v for k, v in stroke_r.items()
+                       if k not in ('paths', 'cleaned', 'skeleton')}
+
+    elif mode == 'contour_art':
+        # Iso-contour topographic mode
+        n_levels = max(3, min(15, round(sensitivity * 1.3)))
+        levels   = _np.linspace(0.12, 0.88, n_levels)
+
+        raw_contours: list = []
+        for level in levels:
+            raw_contours.extend(_sk_measure.find_contours(arr, float(level)))
+
+        quantized = (_np.floor(arr * n_levels) / n_levels * 255).astype(_np.uint8)
+        edges_b64 = _encode_png(quantized)
+
+        base_eps = simplify * 0.5 + 0.2
+        out = []
+        for c in raw_contours:
+            ca    = _np.array(c)
+            perim = _contour_perimeter(ca)
+            if perim < min_length:
+                continue
+            idx        = _adaptive_rdp(ca, base_eps)
+            simplified = ca[idx]
+            if len(simplified) >= 2:
+                out.append(simplified.tolist())
+        out.sort(key=lambda c: -len(c))
+        out = out[:600]
+
+    else:
+        # Accurate: Canny + Scharr gradient combined edge detection pipeline
+        sigma = max(0.5, (11.0 - sensitivity) * 0.38)
+
+        # Canny: spatially clean, well-localised strong edges
+        edges_canny = _sk_feature.canny(arr, sigma=sigma)
+
+        # Scharr gradient magnitude: catches faint edges that fall below Canny's
+        # hysteresis thresholds (thin strokes, low-contrast transitions).
+        gx = _sk_filters.scharr_h(arr)
+        gy = _sk_filters.scharr_v(arr)
+        grad_mag    = _np.hypot(gx, gy)
+        grad_thresh = float(_np.percentile(grad_mag, max(82.0, 100.0 - sensitivity * 1.8)))
+        edges_grad  = grad_mag > grad_thresh
+
+        edges     = edges_canny | edges_grad
+        edges_b64 = _encode_png((edges * 255).astype(_np.uint8))
+
+        # Close broken edge segments (connects short gaps in faint lines),
+        # then open to remove isolated single-pixel noise speckle.
+        edges = _sk_morph.closing(edges, _sk_morph.disk(1))
+        edges = _sk_morph.opening(edges, _sk_morph.disk(1))
+
+        dilated      = _sk_morph.dilation(edges, _sk_morph.square(2))
+        raw_contours = _sk_measure.find_contours(dilated.astype(float), 0.5)
+
+        base_eps = simplify * 0.5 + 0.2
+        out = []
+        for c in raw_contours:
+            ca    = _np.array(c)
+            perim = _contour_perimeter(ca)
+            if perim < min_length:
+                continue
+            # Reject tight noise clusters: mean step < 1.2 px AND barely above
+            # min_length indicates a jagged rasterisation artefact, not a real edge.
+            steps = _np.linalg.norm(_np.diff(ca, axis=0), axis=1)
+            if steps.size > 0 and float(steps.mean()) < 1.2 and perim < min_length * 1.5:
+                continue
+            idx        = _adaptive_rdp(ca, base_eps)
+            simplified = ca[idx]
+            if len(simplified) >= 2:
+                out.append(simplified.tolist())
+        out.sort(key=lambda c: -len(c))
+        out = out[:600]
+
+    total_points = sum(len(c) for c in out)
+
+    response: dict = {
+        'contours':      out,
+        'cleaned_image': cleaned_b64,
+        'edges_image':   edges_b64,
+        'preview_image': edges_b64,
+        'n_contours':    len(out),
+        'total_points':  total_points,
+        'image_width':   w,
+        'image_height':  h,
+        'mode_used':     mode,
+    }
+    if stroke_meta:
+        response.update(stroke_meta)
+    return JSONResponse(response)
+
+
+class PhotoExportRequest(BaseModel):
+    contours:     List[List[List[float]]]
+    image_width:  int
+    image_height: int
+    scale:        float = 1.0
+    filename:     str   = 'traced.dxf'
+
+
+@app.post('/photo-to-dxf/export', summary='Export traced contours as a DXF file')
+async def photo_export(body: PhotoExportRequest, background_tasks: BackgroundTasks):
+    import ezdxf
+
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
+
+    h, s = body.image_height, body.scale
+    for contour in body.contours:
+        if len(contour) < 2:
+            continue
+        pts = [(float(p[1]) * s, float(h - p[0]) * s) for p in contour]
+        msp.add_lwpolyline(pts, close=True)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    doc.saveas(tmp_path)
+    background_tasks.add_task(os.unlink, tmp_path)
+
+    return FileResponse(
+        tmp_path,
+        media_type='application/octet-stream',
+        filename=body.filename,
+        headers={'Content-Disposition': f'attachment; filename="{body.filename}"'},
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DXF GENERATOR
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DxfGenRequest(BaseModel):
+    shape: str = 'rectangle'       # rectangle | circle | rounded_rect | slot | l_bracket | t_bracket
+    width: float = 100.0
+    height: float = 80.0
+    radius: float = 10.0           # corner radius / circle radius
+    slot_length: float = 60.0
+    slot_width: float = 15.0
+    flange_w: float = 40.0         # L/T bracket flange width
+    flange_h: float = 20.0
+    thickness: float = 3.0         # material thickness for notches
+    hole: bool = False
+    hole_radius: float = 5.0
+    hole_x: float = 0.0            # offset from centre; 0 = centre
+    hole_y: float = 0.0
+    kerf: float = 0.0
+    filename: str = 'shape.dxf'
+
+
+def _dxf_rounded_rect(msp, x0: float, y0: float, w: float, h: float, r: float):
+    import ezdxf, math
+    r = min(r, w / 2, h / 2)
+    # Four straight edges
+    msp.add_line((x0 + r, y0),         (x0 + w - r, y0))
+    msp.add_line((x0 + w, y0 + r),     (x0 + w, y0 + h - r))
+    msp.add_line((x0 + w - r, y0 + h), (x0 + r, y0 + h))
+    msp.add_line((x0 + r, y0 + h),     (x0, y0 + h - r))
+    msp.add_line((x0, y0 + h - r),     (x0, y0 + r))
+    msp.add_line((x0, y0 + r),         (x0 + r, y0))
+    # Four corners
+    msp.add_arc((x0 + r,     y0 + r),     r, 180, 270)
+    msp.add_arc((x0 + w - r, y0 + r),     r, 270, 360)
+    msp.add_arc((x0 + w - r, y0 + h - r), r, 0,   90)
+    msp.add_arc((x0 + r,     y0 + h - r), r, 90,  180)
+
+
+@app.post('/dxf-generator/export', summary='Generate parametric DXF shape')
+async def dxf_generator_export(body: DxfGenRequest, background_tasks: BackgroundTasks):
+    import ezdxf, math
+
+    k = body.kerf / 2
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
+
+    if body.shape == 'circle':
+        r = max(0.1, body.radius - k)
+        msp.add_circle((0, 0), radius=r)
+        if body.hole:
+            hr = max(0.1, body.hole_radius + k)
+            msp.add_circle((body.hole_x, body.hole_y), radius=hr)
+
+    elif body.shape == 'rounded_rect':
+        w, h = body.width - 2 * k, body.height - 2 * k
+        _dxf_rounded_rect(msp, 0, 0, w, h, body.radius)
+        if body.hole:
+            hr = max(0.1, body.hole_radius + k)
+            msp.add_circle((w / 2 + body.hole_x, h / 2 + body.hole_y), radius=hr)
+
+    elif body.shape == 'slot':
+        sl, sw = body.slot_length - 2 * k, body.slot_width - 2 * k
+        r = sw / 2
+        msp.add_line((r, 0), (sl - r, 0))
+        msp.add_line((sl - r, sw), (r, sw))
+        msp.add_arc((r,      r), r, 90,  270)
+        msp.add_arc((sl - r, r), r, 270, 90)
+
+    elif body.shape == 'l_bracket':
+        w, h = body.width - 2 * k, body.height - 2 * k
+        fw, fh = body.flange_w, body.flange_h
+        pts = [(0,0),(w,0),(w,fh),(fw,fh),(fw,h),(0,h),(0,0)]
+        for i in range(len(pts) - 1):
+            msp.add_line(pts[i], pts[i + 1])
+
+    elif body.shape == 't_bracket':
+        w, h = body.width - 2 * k, body.height - 2 * k
+        fw, fh = body.flange_w, body.flange_h
+        cx = w / 2
+        pts = [
+            (0, 0), (w, 0), (w, fh), (cx + fw / 2, fh),
+            (cx + fw / 2, h), (cx - fw / 2, h),
+            (cx - fw / 2, fh), (0, fh), (0, 0),
+        ]
+        for i in range(len(pts) - 1):
+            msp.add_line(pts[i], pts[i + 1])
+
+    else:  # rectangle
+        w, h = body.width - 2 * k, body.height - 2 * k
+        msp.add_lwpolyline([(0,0),(w,0),(w,h),(0,h)], close=True)
+        if body.hole:
+            hr = max(0.1, body.hole_radius + k)
+            msp.add_circle((w / 2 + body.hole_x, h / 2 + body.hole_y), radius=hr)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    doc.saveas(tmp_path)
+    background_tasks.add_task(os.unlink, tmp_path)
+    return FileResponse(tmp_path, media_type='application/octet-stream', filename=body.filename,
+                        headers={'Content-Disposition': f'attachment; filename="{body.filename}"'})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHEET LAYOUT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SheetPart(BaseModel):
+    label: str = 'Part'
+    width: float
+    height: float
+    qty: int = 1
+
+class SheetLayoutRequest(BaseModel):
+    sheet_width: float = 1220.0
+    sheet_height: float = 2440.0
+    spacing: float = 5.0
+    parts: List[SheetPart] = []
+    filename: str = 'layout.dxf'
+
+class PackedRect(BaseModel):
+    label: str
+    x: float
+    y: float
+    width: float
+    height: float
+    sheet: int
+
+def _shelf_pack(parts_flat: List[dict], sw: float, sh: float, spacing: float):
+    placed, sheets = [], 0
+    remaining = list(parts_flat)
+    while remaining:
+        sheet_placed, shelf_x, shelf_y, shelf_h = [], spacing, spacing, 0
+        still_remaining = []
+        for p in remaining:
+            pw, ph = p['width'] + spacing, p['height'] + spacing
+            if pw > sw - spacing or ph > sh - spacing:
+                still_remaining.append(p)
+                continue
+            if shelf_x + pw > sw - spacing:
+                shelf_x  = spacing
+                shelf_y += shelf_h + spacing
+                shelf_h  = 0
+            if shelf_y + ph > sh - spacing:
+                still_remaining.append(p)
+                continue
+            sheet_placed.append({**p, 'x': shelf_x, 'y': shelf_y, 'sheet': sheets})
+            shelf_x += pw
+            shelf_h  = max(shelf_h, ph)
+        placed.extend(sheet_placed)
+        if not sheet_placed:
+            break
+        remaining = still_remaining
+        sheets += 1
+    return placed, sheets or 1
+
+
+@app.post('/sheet-layout/pack', summary='Pack parts onto sheets (shelf algorithm)')
+async def sheet_layout_pack(body: SheetLayoutRequest):
+    parts_flat = []
+    for p in body.parts:
+        for _ in range(max(1, p.qty)):
+            parts_flat.append({'label': p.label, 'width': p.width, 'height': p.height})
+    parts_flat.sort(key=lambda p: -p['height'])
+
+    placed, n_sheets = _shelf_pack(parts_flat, body.sheet_width, body.sheet_height, body.spacing)
+    total_area = body.sheet_width * body.sheet_height * n_sheets
+    used_area  = sum(p['width'] * p['height'] for p in placed)
+    efficiency = round(used_area / total_area * 100, 1) if total_area > 0 else 0
+
+    return JSONResponse({
+        'placed': placed,
+        'n_sheets': n_sheets,
+        'n_placed': len(placed),
+        'n_failed': len(parts_flat) - len(placed),
+        'efficiency_pct': efficiency,
+        'sheet_width': body.sheet_width,
+        'sheet_height': body.sheet_height,
+    })
+
+
+@app.post('/sheet-layout/export', summary='Export sheet layout as DXF')
+async def sheet_layout_export(body: SheetLayoutRequest, background_tasks: BackgroundTasks):
+    import ezdxf
+
+    parts_flat = []
+    for p in body.parts:
+        for _ in range(max(1, p.qty)):
+            parts_flat.append({'label': p.label, 'width': p.width, 'height': p.height})
+    parts_flat.sort(key=lambda p: -p['height'])
+    placed, n_sheets = _shelf_pack(parts_flat, body.sheet_width, body.sheet_height, body.spacing)
+
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
+
+    for sheet_idx in range(n_sheets):
+        ox = sheet_idx * (body.sheet_width + 50)
+        # Sheet border
+        msp.add_lwpolyline([
+            (ox, 0), (ox + body.sheet_width, 0),
+            (ox + body.sheet_width, body.sheet_height),
+            (ox, body.sheet_height),
+        ], close=True, dxfattribs={'color': 8})
+        # Parts
+        for p in placed:
+            if p['sheet'] != sheet_idx:
+                continue
+            x, y, pw, ph = ox + p['x'], p['y'], p['width'], p['height']
+            msp.add_lwpolyline([(x, y),(x+pw, y),(x+pw, y+ph),(x, y+ph)], close=True)
+            msp.add_text(p['label'], dxfattribs={'height': min(pw, ph) * 0.12 or 5}).set_placement((x + pw/2, y + ph/2))
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    doc.saveas(tmp_path)
+    background_tasks.add_task(os.unlink, tmp_path)
+    return FileResponse(tmp_path, media_type='application/octet-stream', filename=body.filename,
+                        headers={'Content-Disposition': f'attachment; filename="{body.filename}"'})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3D PANELS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PanelRequest(BaseModel):
+    pattern: str   = 'diamond'   # diamond | hexagon | chevron | brick
+    panel_w: float = 120.0
+    panel_h: float = 80.0
+    cols: int      = 5
+    rows: int      = 4
+    gap: float     = 3.0
+    bevel: float   = 8.0         # inset bevel line depth
+    tab_w: float   = 8.0
+    tab_h: float   = 5.0
+    add_tabs: bool = True
+    filename: str  = 'panels.dxf'
+
+
+def _panel_shape(pattern: str, pw: float, ph: float, bevel: float):
+    """Return list of (x,y) vertices for one panel face."""
+    if pattern == 'diamond':
+        hw, hh = pw / 2, ph / 2
+        return [(hw, 0), (pw, hh), (hw, ph), (0, hh)]
+    elif pattern == 'hexagon':
+        import math
+        r = min(pw, ph) / 2
+        return [(r + r * math.cos(math.radians(60 * i)), r + r * math.sin(math.radians(60 * i))) for i in range(6)]
+    elif pattern == 'chevron':
+        off = pw * 0.25
+        return [(0, 0), (pw, 0), (pw - off, ph), (off, ph)]
+    else:  # brick
+        return [(0, 0), (pw, 0), (pw, ph), (0, ph)]
+
+
+@app.post('/panels/generate', summary='Generate panel layout data')
+async def panels_generate(body: PanelRequest):
+    panels = []
+    import math
+    pw, ph, gap = body.panel_w, body.panel_h, body.gap
+    step_x = pw + gap
+    step_y = ph + gap
+
+    for row in range(body.rows):
+        offset_x = (step_x / 2) if (row % 2 == 1 and body.pattern in ('brick', 'chevron')) else 0
+        for col in range(body.cols):
+            ox = col * step_x + offset_x
+            oy = row * step_y
+            verts = _panel_shape(body.pattern, pw, ph, body.bevel)
+            panels.append({
+                'id': row * body.cols + col,
+                'row': row, 'col': col,
+                'ox': ox, 'oy': oy,
+                'vertices': verts,
+            })
+
+    total_w = body.cols * step_x - gap + (step_x / 2 if body.pattern in ('brick','chevron') else 0)
+    total_h = body.rows * step_y - gap
+    return JSONResponse({
+        'panels': panels,
+        'n_panels': len(panels),
+        'pattern': body.pattern,
+        'panel_w': pw,
+        'panel_h': ph,
+        'total_w': total_w,
+        'total_h': total_h,
+    })
+
+
+@app.post('/panels/export', summary='Export panel layout as DXF')
+async def panels_export(body: PanelRequest, background_tasks: BackgroundTasks):
+    import ezdxf, math
+
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
+    pw, ph, gap = body.panel_w, body.panel_h, body.gap
+    step_x, step_y = pw + gap, ph + gap
+
+    for row in range(body.rows):
+        offset_x = (step_x / 2) if (row % 2 == 1 and body.pattern in ('brick', 'chevron')) else 0
+        for col in range(body.cols):
+            ox = col * step_x + offset_x
+            oy = row * step_y
+            verts = _panel_shape(body.pattern, pw, ph, body.bevel)
+            closed = [(ox + x, oy + y) for x, y in verts]
+            msp.add_lwpolyline(closed, close=True)
+            # Bevel inset line
+            if body.bevel > 0 and body.pattern == 'diamond':
+                b = body.bevel
+                hw, hh = pw / 2, ph / 2
+                inner = [(ox+hw, oy+b),(ox+pw-b, oy+hh),(ox+hw, oy+ph-b),(ox+b, oy+hh)]
+                msp.add_lwpolyline(inner, close=True, dxfattribs={'color': 8})
+            # Tabs
+            if body.add_tabs:
+                tw, th = body.tab_w, body.tab_h
+                cx, cy = ox + pw / 2, oy + ph / 2
+                # Bottom tab
+                msp.add_lwpolyline([
+                    (cx - tw/2, oy), (cx + tw/2, oy),
+                    (cx + tw/2, oy - th), (cx - tw/2, oy - th),
+                ], close=True, dxfattribs={'color': 3})
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    doc.saveas(tmp_path)
+    background_tasks.add_task(os.unlink, tmp_path)
+    return FileResponse(tmp_path, media_type='application/octet-stream', filename=body.filename,
+                        headers={'Content-Disposition': f'attachment; filename="{body.filename}"'})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALUCOBOND CLADDING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import math as _math
+import io   as _io_mod
+import csv  as _csv
+import zipfile as _zipfile
+
+_FACE_ABBR = {'north': 'N', 'south': 'S', 'east': 'E', 'west': 'W'}
+
+class AlucobondBuilding(BaseModel):
+    width:  float = 12000.0   # mm
+    depth:  float = 8000.0
+    height: float = 9000.0
+
+class AlucobondCladding(BaseModel):
+    offset:       float = 50.0
+    panel_width:  float = 1200.0
+    panel_height: float = 600.0
+    joint_gap:    float = 10.0
+    return_depth: float = 30.0
+    pattern:      str   = 'horizontal'  # horizontal | vertical | brick
+
+class AlucobondPanelsRequest(BaseModel):
+    building: AlucobondBuilding
+    cladding: AlucobondCladding
+
+class AlucobondPanelDxfRequest(BaseModel):
+    panel: dict
+    filename: str = 'panel.dxf'
+
+
+# ── Layout helper ─────────────────────────────────────────────────────────────
+
+def _row_x_positions(pw: float, gap: float, face_w: float, is_brick_offset: bool) -> list[tuple[float, float]]:
+    """Return (x_start, visible_width) pairs for one row, left-to-right."""
+    positions: list[tuple[float, float]] = []
+    if is_brick_offset:
+        # Half-panel at left edge (brick starter)
+        hw = pw / 2.0
+        if hw > 0.5:
+            positions.append((0.0, min(hw, face_w)))
+        x = hw + gap
+    else:
+        x = 0.0
+    while x < face_w - 0.5:
+        vw = min(pw, face_w - x)
+        if vw > 0.5:
+            positions.append((x, vw))
+        x += pw + gap
+    return positions
+
+
+def _alucobond_face_panels(face: str, face_w: float, face_h: float, c: AlucobondCladding) -> list:
+    pw, ph = c.panel_width, c.panel_height
+    gap, ret = c.joint_gap, c.return_depth
+
+    if c.pattern == 'vertical':
+        pw, ph = ph, pw
+
+    # Build row y-positions
+    row_ys: list[tuple[float, float]] = []
+    y = 0.0
+    while y < face_h - 0.5:
+        vh = min(ph, face_h - y)
+        if vh > 0.5:
+            row_ys.append((y, vh))
+        y += ph + gap
+    n_rows = len(row_ys)
+
+    abbr = _FACE_ABBR.get(face, face[0].upper())
+    panels = []
+
+    for row_idx, (y, vis_h) in enumerate(row_ys):
+        is_brick_offset = (c.pattern == 'brick') and (row_idx % 2 == 1)
+        x_positions = _row_x_positions(pw, gap, face_w, is_brick_offset)
+        n_cols = len(x_positions)
+
+        for col_idx, (x, vis_w) in enumerate(x_positions):
+            # Edge detection: within 0.5 mm of the face boundary
+            is_left   = (x < 0.5)
+            is_right  = (x + vis_w > face_w - 0.5)
+            is_bottom = (row_idx == 0)
+            is_top    = (row_idx == n_rows - 1)
+
+            r_left   = ret if is_left   else 0.0
+            r_right  = ret if is_right  else 0.0
+            r_bottom = ret if is_bottom else 0.0
+            r_top    = ret if is_top    else 0.0
+
+            edge_flags = sum([is_left, is_right, is_bottom, is_top])
+            ptype = 'corner' if edge_flags >= 2 else ('edge' if edge_flags == 1 else 'interior')
+
+            bw = r_left + vis_w + r_right
+            bh = r_bottom + vis_h + r_top
+
+            # Fold line positions in blank coordinate space
+            fold_lines = []
+            if r_bottom: fold_lines.append({'axis': 'h', 'position': round(r_bottom,       2)})
+            if r_top:    fold_lines.append({'axis': 'h', 'position': round(r_bottom + vis_h, 2)})
+            if r_left:   fold_lines.append({'axis': 'v', 'position': round(r_left,           2)})
+            if r_right:  fold_lines.append({'axis': 'v', 'position': round(r_left + vis_w,   2)})
+
+            panels.append({
+                'id':           f'{abbr}{row_idx:02d}-{col_idx:02d}',
+                'face':         face,
+                'row':          row_idx,
+                'col':          col_idx,
+                'nRows':        n_rows,
+                'nCols':        n_cols,
+                'visibleWidth':  round(vis_w, 2),
+                'visibleHeight': round(vis_h, 2),
+                'visibleArea':   round(vis_w * vis_h / 1_000_000, 4),  # m²
+                'returns':       {'left': r_left, 'right': r_right,
+                                  'top': r_top,   'bottom': r_bottom},
+                'blankWidth':    round(bw, 2),
+                'blankHeight':   round(bh, 2),
+                'blankArea':     round(bw * bh / 1_000_000, 4),        # m²
+                'type':          ptype,
+                'faceOrigin':    [round(x, 2), round(y, 2)],
+                'foldLines':     fold_lines,
+            })
+    return panels
+
+
+# ── DXF generation (shared by single-export and bulk-export) ──────────────────
+
+def _build_panel_dxf(p: dict) -> bytes:
+    import ezdxf
+    ret = p['returns']
+    vw  = float(p['visibleWidth']);  vh = float(p['visibleHeight'])
+    rl  = float(ret['left']);        rr = float(ret['right'])
+    rt  = float(ret['top']);         rb = float(ret['bottom'])
+    bw  = rl + vw + rr;             bh = rb + vh + rt
+
+    doc = ezdxf.new('R2010')
+    doc.units = ezdxf.units.MM
+    msp = doc.modelspace()
+    doc.layers.add('OUTLINE',     color=7)
+    doc.layers.add('FOLD_LINES',  color=1)   # red  – 90° bends
+    doc.layers.add('CUT_MARKS',   color=3)   # green – corner waste removed
+    doc.layers.add('VISIBLE_FACE',color=4)   # cyan  – finished face boundary
+    doc.layers.add('ANNOTATIONS', color=5)   # blue  – dims + text
+
+    # DASHED linetype for fold lines
+    if 'DASHED' not in doc.linetypes:
+        doc.linetypes.add('DASHED', pattern=[8.0, -4.0])
+
+    fold_attr = {'layer': 'FOLD_LINES', 'linetype': 'DASHED', 'ltscale': 5.0}
+
+    # ── Outer blank ──
+    msp.add_lwpolyline(
+        [(0,0),(bw,0),(bw,bh),(0,bh)], close=True,
+        dxfattribs={'layer': 'OUTLINE', 'lineweight': 50},
+    )
+
+    # ── Fold lines (span full blank width/height) ──
+    if rb: msp.add_line((0, rb),       (bw, rb),       dxfattribs=fold_attr)
+    if rt: msp.add_line((0, rb + vh),  (bw, rb + vh),  dxfattribs=fold_attr)
+    if rl: msp.add_line((rl, 0),       (rl, bh),       dxfattribs=fold_attr)
+    if rr: msp.add_line((rl + vw, 0),  (rl + vw, bh),  dxfattribs=fold_attr)
+
+    # ── Corner cut-out marks (waste squares) ──
+    def cut_sq(x: float, y: float, w: float, h: float) -> None:
+        if w > 0 and h > 0:
+            msp.add_lwpolyline([(x,y),(x+w,y),(x+w,y+h),(x,y+h)], close=True,
+                               dxfattribs={'layer': 'CUT_MARKS'})
+            msp.add_line((x, y),   (x+w, y+h), dxfattribs={'layer': 'CUT_MARKS'})
+            msp.add_line((x+w, y), (x,   y+h), dxfattribs={'layer': 'CUT_MARKS'})
+
+    if rl and rb: cut_sq(0,       0,       rl, rb)
+    if rr and rb: cut_sq(rl + vw, 0,       rr, rb)
+    if rl and rt: cut_sq(0,       rb + vh, rl, rt)
+    if rr and rt: cut_sq(rl + vw, rb + vh, rr, rt)
+
+    # ── Visible-face boundary ──
+    msp.add_lwpolyline(
+        [(rl,rb),(rl+vw,rb),(rl+vw,rb+vh),(rl,rb+vh)], close=True,
+        dxfattribs={'layer': 'VISIBLE_FACE', 'lineweight': 25},
+    )
+
+    # ── Return depth labels (centred in each return band) ──
+    ann = {'layer': 'ANNOTATIONS'}
+    def mid_text(cx: float, cy: float, txt: str, h: float = 10.0) -> None:
+        msp.add_text(txt, dxfattribs={**ann, 'height': h,
+                                      'halign': 1, 'valign': 2,
+                                      'insert': (cx, cy), 'align_point': (cx, cy)})
+
+    if rb: mid_text(bw / 2,              rb / 2,              f'↕ {rb:.0f}')
+    if rt: mid_text(bw / 2,              rb + vh + rt / 2,    f'↕ {rt:.0f}')
+    if rl: mid_text(rl / 2,              bh / 2,              f'↔ {rl:.0f}')
+    if rr: mid_text(rl + vw + rr / 2,    bh / 2,              f'↔ {rr:.0f}')
+
+    # ── Header annotations ──
+    msp.add_text(
+        f"PANEL  {p.get('id','?')}   |   FACE: {p.get('face','?').upper()}   |   TYPE: {p.get('type','?').upper()}",
+        dxfattribs={**ann, 'insert': (0, bh + 28), 'height': 20},
+    )
+    msp.add_text(
+        f"Blank: {bw:.0f} × {bh:.0f} mm     Visible face: {vw:.0f} × {vh:.0f} mm     Row {p.get('row','')}  Col {p.get('col','')}",
+        dxfattribs={**ann, 'insert': (0, bh + 54), 'height': 14},
+    )
+    returns_parts = [f"{k[0].upper()}={v:.0f}" for k, v in ret.items() if v]
+    if returns_parts:
+        msp.add_text(
+            'Returns: ' + '  '.join(returns_parts) + ' mm    (fold 90° inward)',
+            dxfattribs={**ann, 'insert': (0, bh + 74), 'height': 12},
+        )
+
+    # ── Dimensions ──
+    try:
+        msp.add_linear_dim(base=(bw/2, -35), p1=(0,0), p2=(bw,0),
+                           dimstyle='Standard', dxfattribs=ann).render()
+        msp.add_linear_dim(base=(-35, bh/2), p1=(0,0), p2=(0,bh),
+                           angle=90, dimstyle='Standard', dxfattribs=ann).render()
+    except Exception:
+        pass
+
+    buf = _io_mod.BytesIO()
+    doc.write(buf)
+    return buf.getvalue()
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.post('/alucobond/panels', summary='Generate Alucobond panel layout for a rectangular building')
+async def alucobond_panels(body: AlucobondPanelsRequest):
+    b, c = body.building, body.cladding
+    W, D, H = b.width, b.depth, b.height
+
+    # N/S faces own the full skin width (W + 2×offset) to cover corner strips.
+    # E/W faces span only the building depth (D) — they sit between the corner strips.
+    skin_w = W + 2 * c.offset
+    face_defs = [('north', skin_w, H), ('south', skin_w, H), ('east', D, H), ('west', D, H)]
+
+    all_panels: list = []
+    face_stats: dict = {}
+    for face_name, fw, fh in face_defs:
+        fps = _alucobond_face_panels(face_name, fw, fh, c)
+        all_panels.extend(fps)
+        face_stats[face_name] = {
+            'count':           len(fps),
+            'visibleAreaM2':   round(sum(p['visibleArea'] for p in fps), 3),
+            'blankAreaM2':     round(sum(p['blankArea']   for p in fps), 3),
+        }
+
+    counts = {'interior': 0, 'edge': 0, 'corner': 0}
+    for p in all_panels:
+        counts[p['type']] += 1
+
+    total_vis  = round(sum(p['visibleArea'] for p in all_panels), 3)
+    total_blnk = round(sum(p['blankArea']   for p in all_panels), 3)
+    waste_pct  = round((total_blnk - total_vis) / total_blnk * 100, 1) if total_blnk else 0
+
+    return {
+        'panels': all_panels,
+        'stats': {
+            'total':         len(all_panels),
+            'interior':      counts['interior'],
+            'edge':          counts['edge'],
+            'corner':        counts['corner'],
+            'visibleAreaM2': total_vis,
+            'blankAreaM2':   total_blnk,
+            'wastePct':      waste_pct,
+            'byFace':        face_stats,
+        },
+    }
+
+
+@app.post('/alucobond/panel-dxf', summary='Export flat-blank DXF for one panel')
+async def alucobond_panel_dxf(body: AlucobondPanelDxfRequest, background_tasks: BackgroundTasks):
+    dxf_bytes = _build_panel_dxf(body.panel)
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    with open(tmp_path, 'wb') as fh:
+        fh.write(dxf_bytes)
+    background_tasks.add_task(os.unlink, tmp_path)
+    filename = body.filename or f"panel_{body.panel.get('id','unknown')}.dxf"
+    return FileResponse(tmp_path, media_type='application/octet-stream', filename=filename,
+                        headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+
+
+@app.post('/alucobond/export-all', summary='Export all panels as a ZIP of DXFs + manifest CSV')
+async def alucobond_export_all(body: AlucobondPanelsRequest, background_tasks: BackgroundTasks):
+    b, c = body.building, body.cladding
+    W, D, H = b.width, b.depth, b.height
+    skin_w = W + 2 * c.offset
+    face_defs = [('north', skin_w, H), ('south', skin_w, H), ('east', D, H), ('west', D, H)]
+
+    all_panels: list = []
+    for face_name, fw, fh in face_defs:
+        all_panels.extend(_alucobond_face_panels(face_name, fw, fh, c))
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.zip')
+    os.close(tmp_fd)
+
+    with _zipfile.ZipFile(tmp_path, 'w', _zipfile.ZIP_DEFLATED) as zf:
+        # One DXF per panel, organised by face folder
+        for p in all_panels:
+            dxf_bytes = _build_panel_dxf(p)
+            zf.writestr(f"{p['face']}/{p['id']}.dxf", dxf_bytes)
+
+        # Manifest CSV
+        csv_buf = _io_mod.StringIO()
+        writer = _csv.writer(csv_buf)
+        writer.writerow([
+            'ID', 'Face', 'Row', 'Col', 'Type',
+            'Visible W (mm)', 'Visible H (mm)',
+            'Blank W (mm)',   'Blank H (mm)',
+            'Return L (mm)', 'Return R (mm)', 'Return T (mm)', 'Return B (mm)',
+            'Visible Area (m²)', 'Blank Area (m²)',
+            'Fold Lines',
+        ])
+        for p in all_panels:
+            r = p['returns']
+            folds = '; '.join(
+                f"{fl['axis'].upper()}@{fl['position']:.0f}" for fl in p['foldLines']
+            )
+            writer.writerow([
+                p['id'], p['face'], p['row'], p['col'], p['type'],
+                p['visibleWidth'], p['visibleHeight'],
+                p['blankWidth'],   p['blankHeight'],
+                r['left'], r['right'], r['top'], r['bottom'],
+                p['visibleArea'], p['blankArea'],
+                folds,
+            ])
+        zf.writestr('manifest.csv', csv_buf.getvalue())
+
+    background_tasks.add_task(os.unlink, tmp_path)
+    return FileResponse(tmp_path, media_type='application/zip', filename='alucobond_panels.zip',
+                        headers={'Content-Disposition': 'attachment; filename="alucobond_panels.zip"'})
+
+
+# ── Folded Board ──────────────────────────────────────────────────────────────
+
+class FoldedBoardDxfRequest(BaseModel):
+    width:             float         # mm — face width  (W)
+    height:            float         # mm — face height (H)
+    edge_depth:        float         # mm — return depth (d)
+    filename:          str = 'folded_board.dxf'
+    design_lines:      list[dict] = []           # [{x1,y1,x2,y2}] — decorative groove lines
+    developed_polygon: list[list[float]] = []    # [[x,y]...] — unfolded face corners in mm
+    design_angle:      float = 0.0               # degrees — decorative bend angle
+
+
+@app.post('/folded-board/dxf', summary='Export flat-blank DXF for a folded rectangular board')
+async def folded_board_dxf(body: FoldedBoardDxfRequest, background_tasks: BackgroundTasks):
+    import ezdxf
+
+    W = float(body.width)
+    H = float(body.height)
+    d = float(body.edge_depth)
+
+    # ── base geometry (matches frontend computeBoard) ────────────────────────
+    face = [(-W/2, H/2), (W/2, H/2), (W/2, -H/2), (-W/2, -H/2)]
+
+    fold_lines = [
+        ((-W/2,  H/2), ( W/2,  H/2)),
+        (( W/2,  H/2), ( W/2, -H/2)),
+        (( W/2, -H/2), (-W/2, -H/2)),
+        ((-W/2, -H/2), (-W/2,  H/2)),
+    ]
+
+    plus = [
+        (-W/2,      H/2 + d),
+        ( W/2,      H/2 + d),
+        ( W/2,      H/2    ),
+        ( W/2 + d,  H/2    ),
+        ( W/2 + d, -H/2    ),
+        ( W/2,     -H/2    ),
+        ( W/2,    -(H/2+d) ),
+        (-W/2,    -(H/2+d) ),
+        (-W/2,     -H/2    ),
+        (-(W/2+d), -H/2    ),
+        (-(W/2+d),  H/2    ),
+        (-W/2,      H/2    ),
+    ]
+
+    # When a developed polygon is supplied, promote it to fabrication geometry:
+    # CUT/BEND/FACE all use developed extents; original W×H face becomes a reference.
+    W_lbl, H_lbl = W, H
+    orig_face = list(face)
+
+    if len(body.developed_polygon) >= 3:
+        dev_pts = [(float(p[0]), float(p[1])) for p in body.developed_polygon]
+        dev_xs  = [p[0] for p in dev_pts]
+        dev_ys  = [p[1] for p in dev_pts]
+        fab_w   = max(dev_xs) - min(dev_xs)
+        fab_h   = max(dev_ys) - min(dev_ys)
+        W_lbl, H_lbl = fab_w, fab_h
+        face = dev_pts
+        fold_lines = [
+            ((-fab_w/2,  fab_h/2), ( fab_w/2,  fab_h/2)),
+            (( fab_w/2,  fab_h/2), ( fab_w/2, -fab_h/2)),
+            (( fab_w/2, -fab_h/2), (-fab_w/2, -fab_h/2)),
+            ((-fab_w/2, -fab_h/2), (-fab_w/2,  fab_h/2)),
+        ]
+        plus = [
+            (-fab_w/2,      fab_h/2 + d),
+            ( fab_w/2,      fab_h/2 + d),
+            ( fab_w/2,      fab_h/2    ),
+            ( fab_w/2 + d,  fab_h/2    ),
+            ( fab_w/2 + d, -fab_h/2    ),
+            ( fab_w/2,     -fab_h/2    ),
+            ( fab_w/2,    -(fab_h/2+d) ),
+            (-fab_w/2,    -(fab_h/2+d) ),
+            (-fab_w/2,     -fab_h/2    ),
+            (-(fab_w/2+d), -fab_h/2    ),
+            (-(fab_w/2+d),  fab_h/2    ),
+            (-fab_w/2,      fab_h/2    ),
+        ]
+
+    # ── build DXF ───────────────────────────────────────────────────────────
+    doc = ezdxf.new('R2010')
+    doc.units = ezdxf.units.MM
+    msp = doc.modelspace()
+    doc.layers.add('FACE',          color=5)   # blue
+    doc.layers.add('BEND',          color=1)   # red
+    doc.layers.add('CUT',           color=3)   # green
+    doc.layers.add('LABELS',        color=7)   # white
+    doc.layers.add('DESIGN_GROOVE', color=6)   # magenta
+    doc.layers.add('DEVELOPED',     color=4)   # cyan
+    if 'DASHED' not in doc.linetypes:
+        doc.linetypes.add('DASHED', pattern=[8.0, -4.0])
+    da = {'linetype': 'DASHED', 'ltscale': 5.0}
+
+    # FACE — visible rectangle
+    msp.add_lwpolyline(face, close=True, dxfattribs={'layer': 'FACE'})
+
+    # CUT — plus-shaped blank boundary (closed polyline)
+    msp.add_lwpolyline(plus, close=True, dxfattribs={'layer': 'CUT'})
+
+    # BEND — fold score lines (dashed)
+    for a, b in fold_lines:
+        msp.add_line(a, b, dxfattribs={'layer': 'BEND', **da})
+
+    # DESIGN_GROOVE — decorative groove lines on face (dashed, magenta)
+    for dl in body.design_lines:
+        msp.add_line(
+            (float(dl['x1']), float(dl['y1'])),
+            (float(dl['x2']), float(dl['y2'])),
+            dxfattribs={'layer': 'DESIGN_GROOVE', **da},
+        )
+    if body.design_lines:
+        msp.add_text('DESIGN_GROOVE (decorative)', dxfattribs={
+            'layer': 'DESIGN_GROOVE', 'height': 10,
+            'insert': (-W_lbl/2, -(H_lbl/2 + d + 40)),
+        })
+
+    # DEVELOPED — original visible face as dashed reference outline
+    if len(body.developed_polygon) >= 3:
+        msp.add_lwpolyline(orig_face, close=True, dxfattribs={'layer': 'DEVELOPED', **da})
+        angle = float(body.design_angle)
+        msp.add_text(
+            f'Visible face: {W:.0f} x {H:.0f} mm  |  Fabrication (developed): {W_lbl:.1f} x {H_lbl:.1f} mm  (bend {angle:.0f} deg)',
+            dxfattribs={
+                'layer': 'DEVELOPED', 'height': 10,
+                'insert': (-W_lbl/2, -(H_lbl/2 + d + 54)),
+            },
+        )
+
+    # LABELS — dimensions (fabrication size when developed)
+    msp.add_text(f'W={W_lbl:.1f}mm', dxfattribs={
+        'layer': 'LABELS', 'height': 14,
+        'insert': (-W_lbl/4, H_lbl/2 + d + 20),
+    })
+    msp.add_text(f'H={H_lbl:.1f}mm', dxfattribs={
+        'layer': 'LABELS', 'height': 14,
+        'insert': (W_lbl/2 + d + 12, 0),
+    })
+    msp.add_text(f'Edge depth: {d:.0f}mm  |  Bend: 90deg inward', dxfattribs={
+        'layer': 'LABELS', 'height': 12,
+        'insert': (-(W_lbl/2 + d), -(H_lbl/2 + d + 24)),
+    })
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    with open(tmp_path, 'w') as fh:
+        doc.write(fh)
+    background_tasks.add_task(os.unlink, tmp_path)
+    fn = body.filename or 'folded_board.dxf'
+    return FileResponse(tmp_path, media_type='application/octet-stream',
+                        filename=fn,
+                        headers={'Content-Disposition': f'attachment; filename="{fn}"'})
+
+
+# ── Corner wrap panel DXF ─────────────────────────────────────────────────────
+
+class CornerWrapDxfRequest(BaseModel):
+    segA:       float          # mm — segment width on Wall A
+    segB:       float          # mm — segment width on Wall B
+    height:     float          # mm — face height
+    edge_depth: float          # mm — return / fold depth
+    filename:   str = 'corner_wrap.dxf'
+
+
+@app.post('/corner-wrap/dxf', summary='Export flat-blank DXF for an inside-corner wrap panel')
+async def corner_wrap_dxf(body: CornerWrapDxfRequest, background_tasks: BackgroundTasks):
+    import ezdxf
+
+    A  = float(body.segA)
+    B  = float(body.segB)
+    H  = float(body.height)
+    d  = float(body.edge_depth)
+
+    # ── Flat-blank layout ────────────────────────────────────────────────────
+    #
+    #  The wrap panel unfolds as a rectangle with two V-notch relief cuts:
+    #  one at the top and one at the bottom of the corner-bend line.
+    #
+    #  X axis: left return → Face A → Face B → right return
+    #  Y axis: bottom return → face → top return
+    #
+    #   Total width  W_tot = 2d + A + B
+    #   Total height H_tot = 2d + H
+    #   Bend line at X = d + A  (the 90° corner fold)
+    #
+    #  V-notch vertices (relief cuts at bend × return intersections):
+    #   bottom: (d+A, d)    top: (d+A, d+H)
+    #
+    # ── CUT polygon — 10 vertices, counter-clockwise ────────────────────────
+
+    W_tot = 2 * d + A + B
+    H_tot = 2 * d + H
+    bx    = d + A            # bend line X
+
+    cut = [
+        (0,     0    ),      # bottom-left
+        (A,     0    ),      # before bottom V-notch (left wing)
+        (bx,    d    ),      # bottom V-notch inner vertex
+        (bx+d,  0    ),      # after bottom V-notch  (right wing)
+        (W_tot, 0    ),      # bottom-right
+        (W_tot, H_tot),      # top-right
+        (bx+d,  H_tot),      # before top V-notch    (right wing)
+        (bx,    d + H),      # top V-notch inner vertex
+        (A,     H_tot),      # after top V-notch     (left wing)
+        (0,     H_tot),      # top-left
+    ]
+
+    # ── Build DXF ────────────────────────────────────────────────────────────
+    doc = ezdxf.new('R2010')
+    doc.units = ezdxf.units.MM
+    msp = doc.modelspace()
+
+    doc.layers.add('CUT',    color=3)   # green
+    doc.layers.add('BEND',   color=1)   # red
+    doc.layers.add('FACE',   color=5)   # blue
+    doc.layers.add('LABELS', color=7)   # white
+    if 'DASHED' not in doc.linetypes:
+        doc.linetypes.add('DASHED', pattern=[8.0, -4.0])
+    da = {'linetype': 'DASHED', 'ltscale': 5.0}
+
+    # CUT — outer boundary with V-notch relief cuts
+    msp.add_lwpolyline(cut, close=True, dxfattribs={'layer': 'CUT'})
+
+    # FACE — two face rectangles (Wall A and Wall B segments)
+    msp.add_lwpolyline(
+        [(d, d), (bx, d), (bx, d+H), (d, d+H)],
+        close=True, dxfattribs={'layer': 'FACE'},
+    )
+    msp.add_lwpolyline(
+        [(bx, d), (bx+B, d), (bx+B, d+H), (bx, d+H)],
+        close=True, dxfattribs={'layer': 'FACE'},
+    )
+
+    # BEND — 7 score lines:
+    #  1 corner bend (main 90° wrap fold)
+    #  2 outer return folds (left / right)
+    #  4 top/bottom return folds (split at bend line)
+    bend_lines = [
+        ((bx,     d  ), (bx,     d+H)),   # corner wrap bend
+        ((d,      d  ), (d,      d+H)),   # left outer return
+        ((bx+B,   d  ), (bx+B,   d+H)),   # right outer return
+        ((d,      d+H), (bx,     d+H)),   # top return — Wall A half
+        ((bx,     d+H), (bx+B,   d+H)),   # top return — Wall B half
+        ((d,      d  ), (bx,     d  )),   # bottom return — Wall A half
+        ((bx,     d  ), (bx+B,   d  )),   # bottom return — Wall B half
+    ]
+    for p1, p2 in bend_lines:
+        msp.add_line(p1, p2, dxfattribs={'layer': 'BEND', **da})
+
+    # LABELS
+    lbl_h = max(10.0, min(A, B, H) * 0.04)
+    msp.add_text(f'A={A:.0f}mm',
+        dxfattribs={'layer': 'LABELS', 'height': lbl_h,
+                    'insert': (d + A/2, d + H/2)})
+    msp.add_text(f'B={B:.0f}mm',
+        dxfattribs={'layer': 'LABELS', 'height': lbl_h,
+                    'insert': (bx + B/2, d + H/2)})
+    msp.add_text(f'H={H:.0f}mm',
+        dxfattribs={'layer': 'LABELS', 'height': lbl_h,
+                    'insert': (d/2, d + H/2)})
+    msp.add_text(f'd={d:.0f}mm',
+        dxfattribs={'layer': 'LABELS', 'height': max(8.0, lbl_h*0.8),
+                    'insert': (d + A/2, H_tot + 6)})
+    msp.add_text('90deg inside corner wrap',
+        dxfattribs={'layer': 'LABELS', 'height': max(8.0, lbl_h*0.8),
+                    'insert': (0, -18)})
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    with open(tmp_path, 'w') as fh:
+        doc.write(fh)
+    background_tasks.add_task(os.unlink, tmp_path)
+    fn = body.filename or 'corner_wrap.dxf'
+    return FileResponse(tmp_path, media_type='application/octet-stream',
+                        filename=fn,
+                        headers={'Content-Disposition': f'attachment; filename="{fn}"'})
+
+
+# ── Outside corner wrap DXF ──────────────────────────────────────────────────
+#
+#  Flat blank for a convex (outside) 90° corner wrap panel.
+#
+#  Layout (left → right):
+#    d_return | segFrom (Wall A/C face) | arc_w (= π/2 × d) | segTo (Wall B/D face) | d_return
+#  Height: d_return (bottom) + face_height + d_return (top)
+#
+#  Bend lines (4 vertical):
+#    x = d                              (from-return fold)
+#    x = d + segFrom                    (face-from → arc transition)
+#    x = d + segFrom + arc_w            (arc → face-to transition)
+#    x = d + segFrom + arc_w + segTo    (to-return fold)
+#
+#  No V-notch relief needed — outside folds don't clash.
+
+import math as _math
+
+class CornerWrapOutsideDxfRequest(BaseModel):
+    segFrom:    float
+    segTo:      float
+    height:     float
+    edge_depth: float
+    filename:   str = 'corner_wrap_outside.dxf'
+
+
+@app.post('/corner-wrap-outside/dxf', summary='Export flat-blank DXF for an outside-corner wrap panel')
+async def corner_wrap_outside_dxf(body: CornerWrapOutsideDxfRequest, background_tasks: BackgroundTasks):
+    import ezdxf
+
+    A  = float(body.segFrom)
+    B  = float(body.segTo)
+    H  = float(body.height)
+    d  = float(body.edge_depth)
+
+    arc_w  = _math.pi / 2 * d          # arc unrolled width
+    W_tot  = d + A + arc_w + B + d     # total blank width
+    H_tot  = d + H + d                 # total blank height
+
+    # Bend line X positions
+    bx1 = d                            # from-return fold
+    bx2 = d + A                        # face-from → arc
+    bx3 = d + A + arc_w               # arc → face-to
+    bx4 = d + A + arc_w + B           # to-return fold
+
+    doc = ezdxf.new('R2010')
+    doc.layers.add('CUT',    color=3)
+    doc.layers.add('BEND',   color=1)
+    doc.layers.add('FACE',   color=5)
+    doc.layers.add('LABELS', color=7)
+    msp = doc.modelspace()
+
+    # CUT — rectangle outline
+    rect = [(0, 0), (W_tot, 0), (W_tot, H_tot), (0, H_tot), (0, 0)]
+    msp.add_lwpolyline(rect, dxfattribs={'layer': 'CUT', 'closed': True})
+
+    # BEND — 4 vertical fold lines
+    for bx in [bx1, bx2, bx3, bx4]:
+        msp.add_line((bx, 0), (bx, H_tot), dxfattribs={'layer': 'BEND'})
+    # BEND — 4 horizontal return fold lines
+    for by in [d, d + H]:
+        msp.add_line((0, by), (W_tot, by), dxfattribs={'layer': 'BEND'})
+
+    # FACE outlines — face-from and face-to rectangles
+    msp.add_lwpolyline(
+        [(bx1, d), (bx2, d), (bx2, d+H), (bx1, d+H)],
+        dxfattribs={'layer': 'FACE', 'closed': True})
+    msp.add_lwpolyline(
+        [(bx3, d), (bx4, d), (bx4, d+H), (bx3, d+H)],
+        dxfattribs={'layer': 'FACE', 'closed': True})
+
+    # LABELS
+    lbl_h = max(H * 0.06, 8.0)
+    msp.add_text(f'A={A:.0f}mm',
+        dxfattribs={'layer': 'LABELS', 'height': lbl_h,
+                    'insert': (bx1 + A/2, d + H/2)})
+    msp.add_text(f'arc={arc_w:.0f}mm',
+        dxfattribs={'layer': 'LABELS', 'height': lbl_h * 0.85,
+                    'insert': (bx2 + arc_w/2, d + H/2)})
+    msp.add_text(f'B={B:.0f}mm',
+        dxfattribs={'layer': 'LABELS', 'height': lbl_h,
+                    'insert': (bx3 + B/2, d + H/2)})
+    msp.add_text(f'd={d:.0f}mm',
+        dxfattribs={'layer': 'LABELS', 'height': lbl_h * 0.8,
+                    'insert': (d/2, d + H/2)})
+    msp.add_text('90deg outside corner wrap',
+        dxfattribs={'layer': 'LABELS', 'height': max(8.0, lbl_h * 0.8),
+                    'insert': (0, -18)})
+
+    import tempfile
+    tmp_path = tempfile.mktemp(suffix='.dxf')
+    with open(tmp_path, 'w') as fh:
+        doc.write(fh)
+    background_tasks.add_task(os.unlink, tmp_path)
+    fn = body.filename or 'corner_wrap_outside.dxf'
+    return FileResponse(tmp_path, media_type='application/octet-stream',
+                        filename=fn,
+                        headers={'Content-Disposition': f'attachment; filename="{fn}"'})
+
+
+# ── Multi-corner wrap DXF ────────────────────────────────────────────────────
+#
+#  Flat blank for a panel that crosses N walls and N-1 corners.
+#
+#  Layout (left → right, X axis):
+#    d_return | face_0 | arc_0 | face_1 | arc_1 | … | face_N | d_return
+#
+#  arc_i width  = (corner_angles[i] in radians) × edge_depth
+#
+#  Height (Y axis):
+#    d_return (bottom) | face_height | d_return (top)
+#
+#  Layers:
+#    CUT    — outer rectangular boundary
+#    BEND   — vertical fold lines at each face boundary + returns;
+#             horizontal return lines at top/bottom
+#    FACE   — face rectangle outlines
+#    LABELS — face widths, arc angles, overall dimensions
+
+class MultiWrapDxfRequest(BaseModel):
+    face_widths:   List[float]       # mm — one entry per wall face
+    corner_angles: List[float]       # degrees — one entry per corner (len = len(face_widths) - 1)
+    height:        float             # mm — face height
+    edge_depth:    float             # mm — return fold depth
+    filename:      str = 'multi_wrap.dxf'
+
+
+@app.post('/multi-wrap/dxf', summary='Export flat-blank DXF for a multi-corner wrap panel')
+async def multi_wrap_dxf(body: MultiWrapDxfRequest, background_tasks: BackgroundTasks):
+    import ezdxf, math
+
+    faces  = [float(w) for w in body.face_widths]
+    angles = [float(a) for a in body.corner_angles]
+    H      = float(body.height)
+    d      = float(body.edge_depth)
+
+    if not faces:
+        raise HTTPException(status_code=422, detail='face_widths must not be empty')
+    if len(angles) != len(faces) - 1:
+        raise HTTPException(status_code=422,
+            detail=f'corner_angles length ({len(angles)}) must equal face_widths length - 1 ({len(faces) - 1})')
+
+    # Arc unrolled width at each corner
+    arc_ws = [math.pi / 180.0 * a * d for a in angles]
+
+    flat_w = d + sum(faces) + sum(arc_ws) + d
+    flat_h = d + H + d
+
+    # ── Cumulative x positions of each section boundary ──────────────────────
+    # section_xs[i] = x at start of face i (after any preceding arc)
+    # bend_xs = x coordinates of each inter-face bend line pair (start, end of arc)
+    section_xs: list[float] = []
+    bend_start_xs: list[float] = []   # x where face i ends / arc i starts
+    bend_end_xs:   list[float] = []   # x where arc i ends / face i+1 starts
+    x = d
+    for i, fw in enumerate(faces):
+        section_xs.append(x)
+        x += fw
+        if i < len(arc_ws):
+            bend_start_xs.append(x)
+            x += arc_ws[i]
+            bend_end_xs.append(x)
+
+    # ── DXF document ─────────────────────────────────────────────────────────
+    doc = ezdxf.new('R2010')
+    doc.units = ezdxf.units.MM
+    msp = doc.modelspace()
+
+    doc.layers.add('CUT',    color=3)    # green
+    doc.layers.add('BEND',   color=1)    # red (dashed)
+    doc.layers.add('FACE',   color=5)    # blue
+    doc.layers.add('LABELS', color=7)    # white
+
+    if 'DASHED' not in doc.linetypes:
+        doc.linetypes.add('DASHED', pattern=[8.0, -4.0])
+    da = {'linetype': 'DASHED', 'ltscale': 5.0}
+
+    # CUT — simple outer rectangle
+    msp.add_lwpolyline(
+        [(0, 0), (flat_w, 0), (flat_w, flat_h), (0, flat_h)],
+        close=True, dxfattribs={'layer': 'CUT'},
+    )
+
+    # BEND — left / right outer returns
+    msp.add_line((d, 0), (d, flat_h), dxfattribs={'layer': 'BEND', **da})
+    msp.add_line((flat_w - d, 0), (flat_w - d, flat_h), dxfattribs={'layer': 'BEND', **da})
+
+    # BEND — horizontal top / bottom return lines
+    msp.add_line((0, d),          (flat_w, d),          dxfattribs={'layer': 'BEND', **da})
+    msp.add_line((0, flat_h - d), (flat_w, flat_h - d), dxfattribs={'layer': 'BEND', **da})
+
+    # BEND — vertical lines at each arc boundary (two per corner: arc start, arc end)
+    for bx_s, bx_e in zip(bend_start_xs, bend_end_xs):
+        msp.add_line((bx_s, 0), (bx_s, flat_h), dxfattribs={'layer': 'BEND', **da})
+        if abs(bx_e - bx_s) > 0.1:   # skip zero-width arcs (d=0)
+            msp.add_line((bx_e, 0), (bx_e, flat_h), dxfattribs={'layer': 'BEND', **da})
+
+    # FACE — outline for each wall face
+    for i, fw in enumerate(faces):
+        x0 = section_xs[i]
+        msp.add_lwpolyline(
+            [(x0, d), (x0 + fw, d), (x0 + fw, d + H), (x0, d + H)],
+            close=True, dxfattribs={'layer': 'FACE'},
+        )
+
+    # LABELS — face widths and arc angles
+    lbl_h = max(10.0, H * 0.05)
+    for i, fw in enumerate(faces):
+        x0 = section_xs[i]
+        tag = chr(ord('A') + i) if i < 26 else str(i + 1)
+        msp.add_text(
+            f'{tag}={fw:.0f}mm',
+            dxfattribs={'layer': 'LABELS', 'height': lbl_h,
+                        'insert': (x0 + fw / 2, d + H / 2)},
+        )
+        if i < len(angles):
+            arc_cx = bend_start_xs[i] + arc_ws[i] / 2
+            msp.add_text(
+                f'{angles[i]:.0f}°',
+                dxfattribs={'layer': 'LABELS',
+                            'height': max(8.0, lbl_h * 0.75),
+                            'insert': (arc_cx, d + H * 0.35)},
+            )
+
+    # Overall dimension label
+    n_corners = len(angles)
+    msp.add_text(
+        f'H={H:.0f}  d={d:.0f}  total={flat_w:.0f}×{flat_h:.0f}mm  '
+        f'{len(faces)} faces  {n_corners} bend{"s" if n_corners != 1 else ""}',
+        dxfattribs={'layer': 'LABELS', 'height': max(8.0, lbl_h * 0.75),
+                    'insert': (0, -20)},
+    )
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    with open(tmp_path, 'w') as fh:
+        doc.write(fh)
+    background_tasks.add_task(os.unlink, tmp_path)
+    fn = body.filename or 'multi_wrap.dxf'
+    return FileResponse(tmp_path, media_type='application/octet-stream',
+                        filename=fn,
+                        headers={'Content-Disposition': f'attachment; filename="{fn}"'})
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 if __name__ == '__main__':

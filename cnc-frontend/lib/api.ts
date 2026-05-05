@@ -212,6 +212,193 @@ export async function exportDXFPerBoard(
   return blob;
 }
 
+// ── Photo → DXF ───────────────────────────────────────────────────────────────
+
+export type TraceMode = "accurate" | "contour_art" | "stroke" | "halftone";
+
+export interface TraceParams {
+  blur: number;        // 0–5  pre-blur (denoise)
+  sensitivity: number; // 1–10 — edge sigma (accurate) or contour levels (contour_art)
+  simplify: number;    // 0–15 RDP epsilon
+  min_length: number;  // 5–80 minimum contour perimeter in px
+  invert: boolean;
+  mode: TraceMode;
+}
+
+/** Each contour is an array of [row, col] points (image coordinate space). */
+export interface TraceResult {
+  contours: [number, number][][];
+  cleaned_image: string;   // grayscale + blur preview
+  edges_image: string;     // Canny edges (accurate) or posterized bands (contour_art)
+  preview_image: string;   // alias for edges_image (backward compat)
+  n_contours: number;
+  total_points: number;
+  image_width: number;
+  image_height: number;
+  mode_used: string;
+  // stroke mode extras
+  binary?: string;
+  segments?: string;
+  merged?: string;
+  n_raw_segments?: number;
+  n_merges?: number;
+  n_bridges?: number;
+  n_discarded?: number;
+  n_crossings?: number;
+  coverage_pct?: number;
+  avg_stroke_len?: number;
+  total_skel_px?: number;
+}
+
+export interface ParamHints {
+  simplify?: number;
+  min_length?: number;
+  sensitivity?: number;
+}
+
+export interface AnalyzeResult {
+  image_type: "line_art" | "silhouette" | "logo" | "photo";
+  recommended_mode: TraceMode;
+  description: string;
+  recommendation: string;
+  artistic_description: string;
+  edge_density: number;
+  contrast: number;
+  param_hints?: ParamHints;
+}
+
+export async function analyzePhoto(file: File, prompt = ""): Promise<AnalyzeResult> {
+  const form = new FormData();
+  form.append("file", file);
+  if (prompt) form.append("prompt", prompt);
+  const resp = await fetch(`${BASE}/photo-to-dxf/analyze`, { method: "POST", body: form });
+  if (!resp.ok) throw new Error(`Analysis failed (${resp.status}): ${await resp.text()}`);
+  return resp.json();
+}
+
+// ── Halftone / Dot mode ───────────────────────────────────────────────────────
+
+export interface HalftoneParams {
+  density: number;      // 10–150 grid cells across longer axis
+  min_radius: number;   // 0.5–5 px minimum circle radius
+  max_radius: number;   // 1–20 px maximum circle radius
+  contrast: number;     // 0.5–3.0 contrast boost before mapping
+  invert: boolean;
+}
+
+export interface HalftoneResult {
+  circles: [number, number, number][];  // [row, col, radius]
+  preview_image: string;                // base64 PNG preview
+  n_circles: number;
+  image_width: number;
+  image_height: number;
+}
+
+export async function traceHalftone(
+  file: File,
+  params: HalftoneParams,
+): Promise<HalftoneResult> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("density",    String(params.density));
+  form.append("min_radius", String(params.min_radius));
+  form.append("max_radius", String(params.max_radius));
+  form.append("contrast",   String(params.contrast));
+  form.append("invert",     String(params.invert));
+
+  const resp = await fetch(`${BASE}/photo-to-dxf/halftone`, { method: "POST", body: form });
+  if (!resp.ok) throw new Error(`Halftone trace failed (${resp.status}): ${await resp.text()}`);
+  return resp.json();
+}
+
+export async function exportHalftoneDXF(
+  circles: [number, number, number][],
+  imageWidth: number,
+  imageHeight: number,
+  scale: number,
+  filename = "halftone.dxf",
+): Promise<void> {
+  const resp = await fetch(`${BASE}/photo-to-dxf/export-halftone`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ circles, image_width: imageWidth, image_height: imageHeight, scale, filename }),
+  });
+  if (!resp.ok) throw new Error(`Halftone export failed (${resp.status}): ${await resp.text()}`);
+  const blob = await resp.blob();
+  triggerDownload(blob, getFilename(resp, filename));
+}
+
+export async function tracePhoto(
+  file: File,
+  params: TraceParams,
+): Promise<TraceResult> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("mode",        params.mode);
+  form.append("blur",        String(params.blur));
+  form.append("sensitivity", String(params.sensitivity));
+  form.append("simplify",    String(params.simplify));
+  form.append("min_length",  String(params.min_length));
+  form.append("invert",      String(params.invert));
+
+  const resp = await fetch(`${BASE}/photo-to-dxf/trace`, { method: "POST", body: form });
+  if (!resp.ok) throw new Error(`Trace failed (${resp.status}): ${await resp.text()}`);
+  return resp.json();
+}
+
+export async function exportPhotoAsDXF(
+  contours: [number, number][][],
+  imageWidth: number,
+  imageHeight: number,
+  scale: number,
+  filename = "traced.dxf",
+): Promise<void> {
+  const resp = await fetch(`${BASE}/photo-to-dxf/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contours, image_width: imageWidth, image_height: imageHeight, scale, filename }),
+  });
+  if (!resp.ok) throw new Error(`Export failed (${resp.status}): ${await resp.text()}`);
+  const blob = await resp.blob();
+  triggerDownload(blob, getFilename(resp, filename));
+}
+
+// ── AI Copilot ────────────────────────────────────────────────────────────────
+
+export interface AiRecommendResult {
+  source: "ai" | "none";
+  recommended_mode?: TraceMode;
+  confidence?: number;
+  explanation?: string;
+  reasoning?: string;
+  param_hints?: ParamHints;
+  error?: string;
+}
+
+export async function aiRecommend(
+  imageType: string,
+  edgeDensity: number,
+  contrast: number,
+  prompt = "",
+): Promise<AiRecommendResult> {
+  try {
+    const resp = await fetch(`${BASE}/ai-recommend`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image_type: imageType,
+        edge_density: edgeDensity,
+        contrast,
+        prompt,
+      }),
+    });
+    if (!resp.ok) return { source: "none", error: `HTTP ${resp.status}` };
+    return resp.json();
+  } catch (err) {
+    return { source: "none", error: String(err) };
+  }
+}
+
 // ── GET /health ───────────────────────────────────────────────────────────────
 
 export async function checkHealth(): Promise<boolean> {
