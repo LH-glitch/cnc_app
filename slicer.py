@@ -128,10 +128,12 @@ class SliceResult:
 
 def load_mesh(path: str):
     """
-    Load an STL file.  Returns a (N, 3, 3) numpy float array.
+    Load a 3D mesh file.  Returns a (N, 3, 3) numpy float array.
 
-    Tries numpy-stl first; falls back to the built-in parser.
+    Supported formats: .stl (numpy-stl or built-in parser), .obj.
     """
+    if path.lower().endswith('.obj'):
+        return _load_obj_builtin(path)
     try:
         from stl import mesh as stl_mesh
         import numpy as np
@@ -1359,3 +1361,39 @@ def _load_stl_builtin(path: str):
                 verts = []
 
     return np.array(tris, dtype=float)
+
+
+def _load_obj_builtin(path: str):
+    """Parse a Wavefront OBJ file. Returns a (N, 3, 3) numpy float array."""
+    import numpy as np
+
+    vertices: List[Tuple[float, float, float]] = []
+    triangles = []
+
+    with open(path, 'r', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if parts[0] == 'v' and len(parts) >= 4:
+                vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif parts[0] == 'f' and len(parts) >= 4:
+                # Each token may be: v  v/vt  v/vt/vn  v//vn  (1-based, negatives ok)
+                indices = []
+                for token in parts[1:]:
+                    vi = int(token.split('/')[0])
+                    if vi < 0:
+                        vi = len(vertices) + vi + 1
+                    indices.append(vi)
+                # Fan triangulation from first vertex
+                for i in range(1, len(indices) - 1):
+                    triangles.append([
+                        vertices[indices[0] - 1],
+                        vertices[indices[i] - 1],
+                        vertices[indices[i + 1] - 1],
+                    ])
+
+    if not triangles:
+        raise ValueError('OBJ file contains no valid triangles')
+    return np.array(triangles, dtype=float)

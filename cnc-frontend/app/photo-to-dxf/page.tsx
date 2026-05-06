@@ -4,9 +4,13 @@ import { useRef, useState, useCallback, useEffect, DragEvent, ChangeEvent } from
 import {
   tracePhoto, analyzePhoto, exportPhotoAsDXF,
   traceHalftone, exportHalftoneDXF,
+  traceOneLine, exportOneLineDXF,
+  generateAiPattern, exportAiPatternDXF,
   aiRecommend,
   TraceResult, TraceParams, AnalyzeResult, TraceMode,
   HalftoneParams, HalftoneResult, AiRecommendResult,
+  OneLineParams, OneLineResult,
+  AiPatternResult, PatternType, PatternStyle, PanelShape,
 } from "@/lib/api";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -23,6 +27,14 @@ const NODE_POSITIONS = [
   [60, 88], [12, 55], [90, 70], [50, 25], [25, 92],
   [78, 55], [40, 40], [65, 72], [15, 10], [55, 10],
 ];
+
+type HalftonePlacementMode = "organic_density" | "hex_packing" | "flow_field";
+
+const HALFTONE_PLACEMENT_LABELS: Record<HalftonePlacementMode, string> = {
+  organic_density: "Organic Density",
+  hex_packing: "Hex Packing",
+  flow_field: "Flow Field",
+};
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
 
@@ -256,9 +268,148 @@ function HalftoneCard({ selected, onSelect, recommended }: {
   );
 }
 
+function OneLineCard({ selected, onSelect }: { selected: boolean; onSelect: () => void }) {
+  return (
+    <div onClick={onSelect} style={{
+      padding: "11px 14px", borderRadius: 10, cursor: "pointer",
+      position: "relative", userSelect: "none",
+      border: selected ? "1px solid rgba(34,211,238,0.5)" : "1px solid rgba(255,255,255,0.08)",
+      background: selected ? "rgba(34,211,238,0.08)" : "rgba(255,255,255,0.02)",
+      transition: "all 0.15s",
+      display: "flex", alignItems: "center", gap: 12,
+    }}>
+      <div style={{ fontSize: 18, lineHeight: 1, flexShrink: 0 }}>∾</div>
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: selected ? "#22d3ee" : "var(--text-muted)", transition: "color 0.15s" }}>
+            One-Line Drawing
+          </span>
+          <span style={{
+            fontSize: 9, fontWeight: 700, color: "#22d3ee",
+            background: "rgba(34,211,238,0.12)", border: "1px solid rgba(34,211,238,0.28)",
+            padding: "1px 6px", borderRadius: 9999,
+          }}>New</span>
+        </div>
+        <div style={{ fontSize: 10, color: "var(--text-subtle)", marginTop: 2 }}>
+          Single continuous path · plotter-style CNC engraving · artistic line work
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AiPatternCard({ selected, onSelect }: { selected: boolean; onSelect: () => void }) {
+  return (
+    <div onClick={onSelect} style={{
+      padding: "11px 14px", borderRadius: 10, cursor: "pointer",
+      position: "relative", userSelect: "none",
+      border: selected ? "1px solid rgba(245,158,11,0.5)" : "1px solid rgba(255,255,255,0.08)",
+      background: selected ? "rgba(245,158,11,0.08)" : "rgba(255,255,255,0.02)",
+      transition: "all 0.15s",
+      display: "flex", alignItems: "center", gap: 12,
+    }}>
+      <div style={{ fontSize: 18, lineHeight: 1, flexShrink: 0 }}>◈</div>
+      <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: selected ? "#fbbf24" : "var(--text-muted)", transition: "color 0.15s" }}>
+            AI Pattern Maker
+          </span>
+          <span style={{
+            fontSize: 9, fontWeight: 700, color: "#f59e0b",
+            background: "rgba(245,158,11,0.15)", border: "1px solid rgba(245,158,11,0.3)",
+            padding: "1px 6px", borderRadius: 9999,
+          }}>New</span>
+        </div>
+        <div style={{ fontSize: 10, color: "var(--text-subtle)", marginTop: 2 }}>
+          Photo → interpreted decorative pattern → CNC-ready DXF
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── One-line SVG preview (animated draw) ──────────────────────────────────────
+
+function OneLineSVG({ result, showJumps }: { result: OneLineResult; showJumps: boolean }) {
+  const { path, image_width: w, image_height: h, jump_indices } = result;
+  const realRef = useRef<SVGPathElement>(null);
+
+  // Split flat path into real-segment subpaths and jump connector subpaths.
+  const jumpSet = new Set(jump_indices);
+  let realD = "", jumpD = "", cur = "";
+  for (let i = 0; i < path.length; i++) {
+    const [r, c] = path[i];
+    if (i === 0) { cur = `M${c.toFixed(1)},${r.toFixed(1)}`; continue; }
+    const [pr, pc] = path[i - 1];
+    if (jumpSet.has(i - 1)) {
+      // Segment i-1 → i is a jump connector
+      if (cur) { realD += (realD ? " " : "") + cur; cur = ""; }
+      jumpD += (jumpD ? " " : "") + `M${pc.toFixed(1)},${pr.toFixed(1)} L${c.toFixed(1)},${r.toFixed(1)}`;
+      cur = `M${c.toFixed(1)},${r.toFixed(1)}`;
+    } else {
+      cur += ` L${c.toFixed(1)},${r.toFixed(1)}`;
+    }
+  }
+  if (cur) realD += (realD ? " " : "") + cur;
+
+  // Animate real path on mount / new result
+  useEffect(() => {
+    const el = realRef.current;
+    if (!el || !realD) return;
+    const len = el.getTotalLength();
+    el.style.strokeDasharray = String(len);
+    el.style.strokeDashoffset = String(len);
+    el.style.transition = "none";
+    void el.getBoundingClientRect();
+    const duration = Math.min(6, Math.max(1.5, len / 2000));
+    el.style.transition = `stroke-dashoffset ${duration}s linear`;
+    el.style.strokeDashoffset = "0";
+  }, [realD]);
+
+  return (
+    <svg
+      viewBox={`0 0 ${w} ${h}`}
+      style={{ width: "100%", height: "auto", display: "block", borderRadius: 10 }}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <rect width={w} height={h} fill="#06060f" />
+      <defs>
+        <pattern id="olgrid" width="32" height="32" patternUnits="userSpaceOnUse">
+          <path d="M 32 0 L 0 0 0 32" fill="none" stroke="rgba(255,255,255,0.025)" strokeWidth="0.5" />
+        </pattern>
+      </defs>
+      <rect width={w} height={h} fill="url(#olgrid)" />
+      {/* Jump connectors — dashed orange travel lines */}
+      {showJumps && jumpD && (
+        <path
+          d={jumpD}
+          fill="none"
+          stroke="rgba(251,146,60,0.50)"
+          strokeWidth={1}
+          strokeLinecap="round"
+          strokeDasharray="3,7"
+        />
+      )}
+      {/* Real drawing path — animated */}
+      {realD && (
+        <path
+          ref={realRef}
+          d={realD}
+          fill="none"
+          stroke="#22d3ee"
+          strokeWidth={1.5}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          opacity={0.92}
+        />
+      )}
+    </svg>
+  );
+}
+
 // ── Halftone SVG preview ──────────────────────────────────────────────────────
 
-function HalftoneSVG({ halftoneResult }: { halftoneResult: HalftoneResult }) {
+function HalftoneSVG({ halftoneResult, showHeatmap = false }: { halftoneResult: HalftoneResult; showHeatmap?: boolean }) {
   const { circles, image_width: w, image_height: h } = halftoneResult;
   return (
     <svg
@@ -266,9 +417,13 @@ function HalftoneSVG({ halftoneResult }: { halftoneResult: HalftoneResult }) {
       style={{ width: "100%", height: "auto", borderRadius: 10, display: "block" }}
       xmlns="http://www.w3.org/2000/svg"
     >
-      <rect width={w} height={h} fill="#06060f" />
+      <rect width={w} height={h} fill="#d6d0c2" />
+      <rect width={w} height={h} fill="rgba(38,32,24,0.10)" />
+      {showHeatmap && halftoneResult.density_heatmap && (
+        <image href={halftoneResult.density_heatmap} width={w} height={h} opacity={0.42} preserveAspectRatio="none" />
+      )}
       {circles.map(([row, col, radius], i) => (
-        <circle key={i} cx={col} cy={row} r={Math.max(0.5, radius)} fill="#fbbf24" opacity={0.85} />
+        <circle key={i} cx={col} cy={row} r={Math.max(0.5, radius)} fill="#090806" opacity={0.92} />
       ))}
     </svg>
   );
@@ -280,15 +435,19 @@ function ScanAnimation({ imageUrl, mode }: { imageUrl: string | null; mode: Trac
   const isStroke    = mode === "stroke";
   const isArt       = mode === "contour_art";
   const isHalftone  = mode === "halftone";
-  const scanColor   = isStroke ? "14,165,233" : isHalftone ? "245,158,11" : "236,72,153";
-  const nodeColorA  = isStroke ? "#38bdf8" : isHalftone ? "#fbbf24" : "#ec4899";
-  const nodeColorB  = isStroke ? "#0ea5e9" : isHalftone ? "#f59e0b" : "#a855f7";
+  const isOneLine   = mode === "one_line";
+  const isAiPattern = mode === "ai_pattern";
+  const scanColor   = isStroke ? "14,165,233" : isOneLine ? "34,211,238" : isHalftone || isAiPattern ? "245,158,11" : "236,72,153";
+  const nodeColorA  = isStroke ? "#38bdf8" : isOneLine ? "#22d3ee" : isHalftone ? "#fbbf24" : "#ec4899";
+  const nodeColorB  = isStroke ? "#0ea5e9" : isOneLine ? "#06b6d4" : isHalftone ? "#f59e0b" : "#a855f7";
 
   const statusText = isStroke ? "Reconstructing stroke paths…"
+    : isOneLine ? "Building one-line path…"
     : isHalftone ? "Building halftone dot grid…"
     : isArt ? "Mapping contour levels…"
     : "Detecting edges…";
   const subText = isStroke ? "bilateral denoise · Sauvola binarize · crossing disambiguation · global assembly"
+    : isOneLine ? "skeletonize · chain tracing · greedy nearest-neighbor tour · RDP simplify"
     : isHalftone ? "brightness sampling · radius mapping · circle generation"
     : isArt ? "iso-contours · RDP simplification"
     : "Canny · dilation · RDP simplification";
@@ -330,7 +489,7 @@ function ScanAnimation({ imageUrl, mode }: { imageUrl: string | null; mode: Trac
           display: "flex", alignItems: "center", gap: 10,
         }}>
           <Spinner size={11} />
-          <span style={{ fontSize: 12, color: isStroke ? "rgba(186,230,253,0.95)" : "rgba(249,168,212,0.95)", letterSpacing: "0.05em" }}>
+          <span style={{ fontSize: 12, color: (isStroke || isOneLine) ? "rgba(186,230,253,0.95)" : "rgba(249,168,212,0.95)", letterSpacing: "0.05em" }}>
             {statusText}
           </span>
         </div>
@@ -420,8 +579,10 @@ function ContourSVG({ result, mode }: { result: TraceResult; mode: TraceMode }) 
 function Stat({ label, value, mode }: { label: string; value: string; mode: TraceMode }) {
   const gradient = mode === "stroke"
     ? "linear-gradient(135deg, #0ea5e9, #38bdf8)"
-    : mode === "halftone"
+    : mode === "halftone" || mode === "ai_pattern"
     ? "linear-gradient(135deg, #f59e0b, #fbbf24)"
+    : mode === "one_line"
+    ? "linear-gradient(135deg, #06b6d4, #22d3ee)"
     : "linear-gradient(135deg, #ec4899, #a855f7)";
   return (
     <div className="glass-sm" style={{ padding: "9px 14px", textAlign: "center", flex: 1 }}>
@@ -588,6 +749,20 @@ function AiCopilotCard({ ai, aiLoading, traceMode, onApply }: {
 // ── Mode tips ─────────────────────────────────────────────────────────────────
 
 const MODE_TIPS: Record<TraceMode, string[]> = {
+  ai_pattern: [
+    "Contour Relief: topographic iso-lines ideal for wall art and engraving",
+    "Groove: brightness-driven scan-line grooves — great for Alucobond and wood engraving",
+    "Perforation: brightness → hole size grid — ready for CNC drilling",
+    "Facade: geometric tile pattern (hex/triangle/diamond/wave) for architectural panels",
+    "Style controls how cells are selected: clean=binary threshold, organic=variable size",
+  ],
+  one_line: [
+    "Creates a single continuous path — no pen lifts, like a plotter drawing",
+    "Lower Detail (1–3) for bold simplified silhouettes",
+    "Higher Detail (8–10) to trace fine texture and structure",
+    "Higher Jump Penalty keeps the path flowing forward, reducing backtracking",
+    "Enable Invert for light drawings on a dark background",
+  ],
   stroke: [
     "Best for sketches, portraits, and pen/ink line art",
     "Enable Invert for light strokes on dark background",
@@ -648,6 +823,29 @@ export default function PhotoToDXFPage() {
   const [halftoneMinR,     setHalftoneMinR]     = useState(0.5);
   const [halftoneMaxR,     setHalftoneMaxR]     = useState(8);
   const [halftoneContrast, setHalftoneContrast] = useState(1.2);
+  const [halftonePlacement, setHalftonePlacement] = useState<HalftonePlacementMode>("organic_density");
+  const [halftoneRandomness, setHalftoneRandomness] = useState(0.55);
+  const [halftoneDensitySensitivity, setHalftoneDensitySensitivity] = useState(1.25);
+  const [showHalftoneHeatmap, setShowHalftoneHeatmap] = useState(false);
+
+  // ── One-line state ──────────────────────────────────────────────────────────
+  const [oneLineResult,  setOneLineResult]  = useState<OneLineResult | null>(null);
+  const [olDetail,       setOlDetail]       = useState(5.0);
+  const [olSimplify,     setOlSimplify]     = useState(3.0);
+  const [olJumpPenalty,  setOlJumpPenalty]  = useState(0.5);
+  const [olPreviewMode,  setOlPreviewMode]  = useState<"original" | "enhanced" | "skeleton" | "oneline">("oneline");
+  const [showJumps,      setShowJumps]      = useState(true);
+
+  // ── AI Pattern state ────────────────────────────────────────────────────────
+  const [aiPatternResult, setAiPatternResult] = useState<AiPatternResult | null>(null);
+  const [apPatternType,   setApPatternType]   = useState<PatternType>("contour_relief");
+  const [apStyle,         setApStyle]         = useState<PatternStyle>("clean");
+  const [apDetail,        setApDetail]        = useState(5.0);
+  const [apMinSpacing,    setApMinSpacing]    = useState(8.0);
+  const [apMinHoleSize,   setApMinHoleSize]   = useState(4.0);
+  const [apMaxElements,   setApMaxElements]   = useState(1500);
+  const [apPanelShape,    setApPanelShape]    = useState<PanelShape>("hexagon");
+  const [apPreviewMode,   setApPreviewMode]   = useState<"original" | "analysis" | "pattern">("pattern");
 
   // ── AI prompt state ─────────────────────────────────────────────────────────
   const [prompt, setPrompt] = useState("");
@@ -683,7 +881,7 @@ export default function PhotoToDXFPage() {
   async function acceptFile(f: File) {
     if (imageUrl) URL.revokeObjectURL(imageUrl);
     setFile(f); setImageUrl(URL.createObjectURL(f));
-    setResult(null); setHalftoneResult(null); setErrorMsg(""); setAppState("idle");
+    setResult(null); setHalftoneResult(null); setOneLineResult(null); setErrorMsg(""); setAppState("idle");
     setAnalysis(null); setAiAnalysis(null); setAiLoading(false);
 
     setAnalyzing(true);
@@ -726,18 +924,50 @@ export default function PhotoToDXFPage() {
 
   function selectMode(m: TraceMode) {
     setTraceMode(m);
-    if (result || halftoneResult) { setResult(null); setHalftoneResult(null); setAppState("idle"); }
+    if (result || halftoneResult || oneLineResult || aiPatternResult) { setResult(null); setHalftoneResult(null); setOneLineResult(null); setAiPatternResult(null); setAppState("idle"); }
   }
 
   // ── Trace ──────────────────────────────────────────────────────────────────
   async function handleTrace() {
     if (!file) return;
-    setAppState("tracing"); setResult(null); setHalftoneResult(null); setErrorMsg("");
+    setAppState("tracing"); setResult(null); setHalftoneResult(null); setOneLineResult(null); setAiPatternResult(null); setErrorMsg("");
+
+    if (traceMode === "ai_pattern") {
+      try {
+        const r = await generateAiPattern(
+          file,
+          { pattern_type: apPatternType, style: apStyle, detail: apDetail,
+            min_spacing: apMinSpacing, min_hole_size: apMinHoleSize,
+            max_elements: apMaxElements, panel_shape: apPanelShape },
+          blur, invert, parseFloat(scale) || 1.0,
+        );
+        setAiPatternResult(r); setAppState("done"); setApPreviewMode("pattern");
+      } catch (err: unknown) {
+        setErrorMsg(err instanceof Error ? err.message : String(err));
+        setAppState("error");
+      }
+      return;
+    }
+
+    if (traceMode === "one_line") {
+      const params: OneLineParams = { detail: olDetail, simplify: olSimplify, jump_penalty: olJumpPenalty, blur, invert };
+      try {
+        const r = await traceOneLine(file, params);
+        setOneLineResult(r); setAppState("done"); setOlPreviewMode("oneline");
+      } catch (err: unknown) {
+        setErrorMsg(err instanceof Error ? err.message : String(err));
+        setAppState("error");
+      }
+      return;
+    }
 
     if (traceMode === "halftone") {
       const params: HalftoneParams = {
         density: halftoneDensity, min_radius: halftoneMinR, max_radius: halftoneMaxR,
         contrast: halftoneContrast, invert,
+        placement_mode: halftonePlacement,
+        randomness: halftoneRandomness,
+        density_sensitivity: halftoneDensitySensitivity,
       };
       try {
         const r = await traceHalftone(file, params);
@@ -763,10 +993,17 @@ export default function PhotoToDXFPage() {
   async function handleExport() {
     setExportBusy(true); setExportSuccess(false);
     try {
-      if (traceMode === "halftone" && halftoneResult) {
+      if (traceMode === "ai_pattern" && aiPatternResult) {
+        await exportAiPatternDXF(aiPatternResult, parseFloat(scale) || 1.0, "pattern.dxf");
+      } else if (traceMode === "halftone" && halftoneResult) {
         await exportHalftoneDXF(
           halftoneResult.circles, halftoneResult.image_width, halftoneResult.image_height,
           parseFloat(scale) || 1.0, "halftone.dxf",
+        );
+      } else if (traceMode === "one_line" && oneLineResult) {
+        await exportOneLineDXF(
+          oneLineResult.path, oneLineResult.image_width, oneLineResult.image_height,
+          parseFloat(scale) || 1.0, "one-line.dxf",
         );
       } else if (result) {
         await exportPhotoAsDXF(result.contours, result.image_width, result.image_height, parseFloat(scale) || 1.0);
@@ -780,17 +1017,19 @@ export default function PhotoToDXFPage() {
     }
   }
 
-  function resetToIdle() { setResult(null); setHalftoneResult(null); setAppState("idle"); setExportSuccess(false); }
+  function resetToIdle() { setResult(null); setHalftoneResult(null); setOneLineResult(null); setAiPatternResult(null); setAppState("idle"); setExportSuccess(false); }
 
-  const activeImgW = result ? result.image_width : halftoneResult ? halftoneResult.image_width : null;
-  const activeImgH = result ? result.image_height : halftoneResult ? halftoneResult.image_height : null;
+  const activeImgW = result ? result.image_width : halftoneResult ? halftoneResult.image_width : oneLineResult ? oneLineResult.image_width : aiPatternResult ? aiPatternResult.image_width : null;
+  const activeImgH = result ? result.image_height : halftoneResult ? halftoneResult.image_height : oneLineResult ? oneLineResult.image_height : aiPatternResult ? aiPatternResult.image_height : null;
   const dxfW = activeImgW ? (activeImgW * (parseFloat(scale) || 1)).toFixed(0) : "—";
   const dxfH = activeImgH ? (activeImgH * (parseFloat(scale) || 1)).toFixed(0) : "—";
 
   // Dynamic labels
   const step3Title = traceMode === "accurate" ? "Detect Edges"
     : traceMode === "contour_art" ? "Configure Levels"
-    : traceMode === "halftone" ? "Dot Grid Settings"
+    : traceMode === "halftone" ? "Dot Placement"
+    : traceMode === "one_line" ? "Path Settings"
+    : traceMode === "ai_pattern" ? "Pattern Design"
     : "Threshold & Clean";
 
   const edgesTabLabel = traceMode === "stroke" ? "Skeleton"
@@ -805,11 +1044,16 @@ export default function PhotoToDXFPage() {
   const traceButtonLabel = traceMode === "stroke" ? "✏  Trace High-Fidelity"
     : traceMode === "halftone" ? "◉  Generate Dots"
     : traceMode === "contour_art" ? "⊚  Trace Contour Art"
+    : traceMode === "one_line" ? "∾  Draw One Line"
+    : traceMode === "ai_pattern" ? "◈  Generate Pattern"
     : "⊙  Trace Accurately";
 
   const modeChipLabel = traceMode === "stroke" ? "✏ Hi-Fi Stroke"
     : traceMode === "halftone" ? "◉ Halftone"
-    : traceMode === "contour_art" ? "⊚ Contour Art" : "⊙ Accurate";
+    : traceMode === "one_line" ? "∾ One-Line"
+    : traceMode === "contour_art" ? "⊚ Contour Art"
+    : traceMode === "ai_pattern" ? "◈ AI Pattern"
+    : "⊙ Accurate";
 
   const pageSubtitle = traceMode === "stroke"
     ? "Skeleton centerlines · junction merge · DXF export"
@@ -817,9 +1061,13 @@ export default function PhotoToDXFPage() {
     ? "Dot grid · brightness mapping · DXF circles export"
     : traceMode === "contour_art"
     ? "Iso-contour topographic art · RDP simplification · DXF export"
+    : traceMode === "one_line"
+    ? "Single continuous path · plotter-style · DXF export"
+    : traceMode === "ai_pattern"
+    ? "Image analysis · decorative pattern generation · CNC-ready DXF"
     : "Canny edge detection · RDP simplification · DXF export";
 
-  const hasDoneResult = appState === "done" && (result !== null || halftoneResult !== null);
+  const hasDoneResult = appState === "done" && (result !== null || halftoneResult !== null || oneLineResult !== null || aiPatternResult !== null);
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -868,6 +1116,20 @@ export default function PhotoToDXFPage() {
                 selected={traceMode === "halftone"}
                 onSelect={() => selectMode("halftone")}
                 recommended={analysis?.recommended_mode === "halftone"}
+              />
+            </div>
+            {/* Row 4: One-Line Drawing — full width */}
+            <div style={{ marginTop: 8 }}>
+              <OneLineCard
+                selected={traceMode === "one_line"}
+                onSelect={() => selectMode("one_line")}
+              />
+            </div>
+            {/* Row 5: AI Pattern Maker — full width */}
+            <div style={{ marginTop: 8 }}>
+              <AiPatternCard
+                selected={traceMode === "ai_pattern"}
+                onSelect={() => selectMode("ai_pattern")}
               />
             </div>
           </div>
@@ -955,13 +1217,176 @@ export default function PhotoToDXFPage() {
           {/* Step 3 — mode-specific */}
           <StepSection step={3} title={step3Title}>
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-              {traceMode === "halftone" ? (
+              {traceMode === "ai_pattern" ? (
+                <>
+                  <div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Pattern Type</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                      {([
+                        { id: "contour_relief" as PatternType, label: "Contour Relief", desc: "Topographic layers" },
+                        { id: "groove"         as PatternType, label: "Groove",         desc: "Brightness scan lines" },
+                        { id: "perforation"    as PatternType, label: "Perforation",    desc: "Drill hole grid" },
+                        { id: "facade"         as PatternType, label: "Facade Panels",  desc: "Geometric tiling" },
+                      ]).map(({ id, label, desc }) => (
+                        <button key={id} type="button" onClick={() => setApPatternType(id)}
+                          style={{
+                            padding: "8px 10px", borderRadius: 8, cursor: "pointer", textAlign: "left",
+                            border: apPatternType === id ? "1px solid rgba(245,158,11,0.5)" : "1px solid rgba(255,255,255,0.08)",
+                            background: apPatternType === id ? "rgba(245,158,11,0.1)" : "rgba(255,255,255,0.02)",
+                            transition: "all 0.15s",
+                          }}>
+                          <div style={{ fontSize: 11, fontWeight: 700, color: apPatternType === id ? "#fbbf24" : "var(--text-muted)" }}>{label}</div>
+                          <div style={{ fontSize: 9, color: "var(--text-subtle)", marginTop: 1 }}>{desc}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Style</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
+                      {([
+                        { id: "clean"     as PatternStyle, label: "Clean",    hint: "Binary threshold, sharp edges" },
+                        { id: "organic"   as PatternStyle, label: "Organic",   hint: "Variable size, flowing forms" },
+                        { id: "geometric" as PatternStyle, label: "Geometric", hint: "Structured, regular grid" },
+                        { id: "facade"    as PatternStyle, label: "Facade",    hint: "Modulated by brightness" },
+                      ]).map(({ id, label, hint }) => (
+                        <button key={id} type="button" onClick={() => setApStyle(id)} title={hint}
+                          style={{
+                            padding: "5px 8px", borderRadius: 6, cursor: "pointer",
+                            border: apStyle === id ? "1px solid rgba(245,158,11,0.45)" : "1px solid rgba(255,255,255,0.08)",
+                            background: apStyle === id ? "rgba(245,158,11,0.1)" : "rgba(255,255,255,0.02)",
+                            fontSize: 11, fontWeight: 600,
+                            color: apStyle === id ? "#fbbf24" : "var(--text-subtle)",
+                            transition: "all 0.15s",
+                          }}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <SliderRow
+                    label="Detail" sub="pattern density"
+                    hint="Higher = more contour levels / denser lines / finer geometry."
+                    min={1} max={10} step={0.5} value={apDetail} onChange={setApDetail}
+                    format={(v) => v.toFixed(1)}
+                  />
+                  <SliderRow
+                    label="Min Spacing" sub="px"
+                    hint="Minimum gap between elements. Keeps parts manufacturable."
+                    min={3} max={30} step={0.5} value={apMinSpacing} onChange={setApMinSpacing}
+                    format={(v) => `${v.toFixed(1)} px`}
+                  />
+
+                  {apPatternType === "perforation" && (
+                    <SliderRow
+                      label="Min Hole Size" sub="px diameter"
+                      hint="Smallest drillable hole. Prevents too-small holes."
+                      min={1} max={20} step={0.5} value={apMinHoleSize} onChange={setApMinHoleSize}
+                      format={(v) => `${v.toFixed(1)} px`}
+                    />
+                  )}
+
+                  {apPatternType === "facade" && (
+                    <div>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>Panel Shape</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
+                        {([
+                          { id: "hexagon"  as PanelShape, label: "Hexagon"  },
+                          { id: "triangle" as PanelShape, label: "Triangle" },
+                          { id: "diamond"  as PanelShape, label: "Diamond"  },
+                          { id: "wave"     as PanelShape, label: "Wave"     },
+                        ]).map(({ id, label }) => (
+                          <button key={id} type="button" onClick={() => setApPanelShape(id)}
+                            style={{
+                              padding: "5px 8px", borderRadius: 6, cursor: "pointer",
+                              border: apPanelShape === id ? "1px solid rgba(245,158,11,0.45)" : "1px solid rgba(255,255,255,0.08)",
+                              background: apPanelShape === id ? "rgba(245,158,11,0.1)" : "rgba(255,255,255,0.02)",
+                              fontSize: 11, fontWeight: 600,
+                              color: apPanelShape === id ? "#fbbf24" : "var(--text-subtle)",
+                              transition: "all 0.15s",
+                            }}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <SliderRow
+                    label="Max Elements" sub="limit"
+                    hint="Cap on total pattern elements. Higher = more detail but slower export."
+                    min={100} max={5000} step={100} value={apMaxElements} onChange={setApMaxElements}
+                    format={(v) => v.toLocaleString()}
+                  />
+                </>
+              ) : traceMode === "one_line" ? (
                 <>
                   <SliderRow
+                    label="Detail" sub="skeleton density"
+                    hint="Higher = captures finer structure. Lower = bold simplified silhouette."
+                    min={1} max={10} step={0.5} value={olDetail} onChange={setOlDetail}
+                    format={(v) => v.toFixed(1)}
+                  />
+                  <SliderRow
+                    label="Jump Penalty" sub="continuity"
+                    hint="Higher = path prefers to continue forward rather than backtrack. Reduces cross-jumps."
+                    min={0} max={1} step={0.05} value={olJumpPenalty} onChange={setOlJumpPenalty}
+                    format={(v) => v.toFixed(2)}
+                  />
+                  <div className="glass-sm" style={{ padding: "10px 12px", borderRadius: 8 }}>
+                    <div style={{ fontSize: 10, color: "var(--text-subtle)", lineHeight: 1.6 }}>
+                      Creates a single continuous path that approximates the image, useful for plotter-style CNC engraving or artistic line work.
+                    </div>
+                  </div>
+                </>
+              ) : traceMode === "halftone" ? (
+                <>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                      <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Placement Mode</span>
+                      <span style={{ fontSize: 10, color: "var(--text-subtle)" }}>{HALFTONE_PLACEMENT_LABELS[halftonePlacement]}</span>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6 }}>
+                      {(["organic_density", "hex_packing", "flow_field"] as HalftonePlacementMode[]).map((mode) => {
+                        const active = halftonePlacement === mode;
+                        return (
+                          <button
+                            key={mode}
+                            type="button"
+                            onClick={() => setHalftonePlacement(mode)}
+                            style={{
+                              minHeight: 34, borderRadius: 7, cursor: "pointer",
+                              border: active ? "1px solid rgba(251,191,36,0.55)" : "1px solid rgba(255,255,255,0.08)",
+                              background: active ? "rgba(245,158,11,0.14)" : "rgba(255,255,255,0.035)",
+                              color: active ? "#fde68a" : "var(--text-muted)",
+                              fontSize: 10, fontWeight: 700,
+                            }}
+                          >
+                            {HALFTONE_PLACEMENT_LABELS[mode]}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <SliderRow
                     label="Density" sub="dots across"
-                    hint="Number of dot grid cells across the longer image axis. Higher = finer dot pattern."
+                    hint="Overall candidate density across the longer image axis. Dark regions still pack more tightly than highlights."
                     min={10} max={150} step={5} value={halftoneDensity} onChange={setHalftoneDensity}
                     format={(v) => `${v}`}
+                  />
+                  <SliderRow
+                    label="Organic randomness" sub="placement"
+                    hint="Controls jitter and natural variation. Hex mode uses a lighter amount so rows stay manufacturable."
+                    min={0} max={1} step={0.05} value={halftoneRandomness} onChange={setHalftoneRandomness}
+                    format={(v) => v.toFixed(2)}
+                  />
+                  <SliderRow
+                    label="Density sensitivity" sub="brightness"
+                    hint="Higher values make dark areas pack much denser while bright areas open up faster."
+                    min={0.35} max={3} step={0.05} value={halftoneDensitySensitivity} onChange={setHalftoneDensitySensitivity}
+                    format={(v) => v.toFixed(2)}
                   />
                   <SliderRow
                     label="Min circle" sub="px radius"
@@ -1004,7 +1429,7 @@ export default function PhotoToDXFPage() {
                   format={(v) => `${Math.max(3, Math.min(15, Math.round(v * 1.3)))} bands`}
                 />
               )}
-              {traceMode !== "halftone" && (
+              {traceMode !== "halftone" && traceMode !== "one_line" && (
                 <SliderRow
                   label={traceMode === "stroke" ? "Min stroke length" : "Min path"}
                   sub="pixels"
@@ -1022,13 +1447,17 @@ export default function PhotoToDXFPage() {
           {/* Step 4 */}
           <StepSection step={4} title="Trace & Simplify" done={hasDoneResult}>
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              {traceMode !== "halftone" && (
+              {traceMode !== "halftone" && traceMode !== "ai_pattern" && (
                 <SliderRow
                   label="Simplify" sub="path precision"
                   hint={traceMode === "stroke"
                     ? "RDP tolerance on the final skeleton paths. Higher = fewer, smoother anchor points."
+                    : traceMode === "one_line"
+                    ? "RDP tolerance on the one-line path. Higher = fewer points, smoother curves."
                     : "Higher = fewer points, smoother paths. Lower = preserves fine detail."}
-                  min={0} max={15} step={0.5} value={simplify} onChange={setSimplify}
+                  min={0} max={15} step={0.5}
+                  value={traceMode === "one_line" ? olSimplify : simplify}
+                  onChange={traceMode === "one_line" ? setOlSimplify : setSimplify}
                   format={(v) => v === 0 ? "None" : v.toFixed(1)}
                 />
               )}
@@ -1061,9 +1490,13 @@ export default function PhotoToDXFPage() {
                 <div style={{ fontSize: 11, color: "var(--text-subtle)", textAlign: "center" }}>
                   {halftoneResult
                     ? `${halftoneResult.n_circles.toLocaleString()} circles`
-                    : result
-                      ? `${result.n_contours} ${traceMode === "stroke" ? "stroke" : "contour"}${result.n_contours !== 1 ? "s" : ""} · ${result.total_points.toLocaleString()} points`
-                      : ""}
+                    : oneLineResult
+                      ? `${oneLineResult.n_points.toLocaleString()} pts · ${oneLineResult.n_jumps} jumps`
+                      : aiPatternResult
+                        ? `${aiPatternResult.n_elements.toLocaleString()} elements`
+                        : result
+                          ? `${result.n_contours} ${traceMode === "stroke" ? "stroke" : "contour"}${result.n_contours !== 1 ? "s" : ""} · ${result.total_points.toLocaleString()} points`
+                          : ""}
                 </div>
               )}
             </div>
@@ -1075,7 +1508,7 @@ export default function PhotoToDXFPage() {
         <div className="glass" style={{ flex: 1, minWidth: 0, padding: "22px 24px", display: "flex", flexDirection: "column", gap: 20, minHeight: 560 }}>
 
           {/* ── Idle ── */}
-          {appState !== "tracing" && !result && !halftoneResult && (
+          {appState !== "tracing" && !result && !halftoneResult && !oneLineResult && !aiPatternResult && (
             <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20, padding: "32px 0" }}>
               <PhotoIllustration />
 
@@ -1085,6 +1518,8 @@ export default function PhotoToDXFPage() {
                     {traceMode === "stroke" ? "✏ Stroke Trace ready"
                       : traceMode === "halftone" ? "◉ Halftone Dots ready"
                       : traceMode === "contour_art" ? "⊚ Contour Art ready"
+                      : traceMode === "one_line" ? "∾ One-Line Drawing ready"
+                      : traceMode === "ai_pattern" ? "◈ AI Pattern Maker ready"
                       : "⊙ Accurate Trace ready"}
                   </div>
 
@@ -1100,17 +1535,21 @@ export default function PhotoToDXFPage() {
                       ? "Adjust Density and circle sizes, then click Generate Dots."
                       : traceMode === "contour_art"
                       ? "Adjust Contour Levels for tonal density, then click Trace Contour Art."
+                      : traceMode === "one_line"
+                      ? "Adjust Detail and Jump Penalty, then click Draw One Line."
+                      : traceMode === "ai_pattern"
+                      ? "Choose a pattern type and style, then click Generate Pattern."
                       : "Adjust Edge Sensitivity for the right level of detail, then click Trace Accurately."}
                   </div>
 
                   <div className="glass-sm" style={{ padding: "10px 16px", width: "100%", maxWidth: 380 }}>
                     <div style={{ fontSize: 10, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>
-                      Tips for {traceMode === "stroke" ? "Stroke Trace" : traceMode === "halftone" ? "Halftone Dots" : traceMode === "contour_art" ? "Contour Art" : "Accurate Trace"}
+                      Tips for {traceMode === "stroke" ? "Stroke Trace" : traceMode === "halftone" ? "Halftone Dots" : traceMode === "contour_art" ? "Contour Art" : traceMode === "one_line" ? "One-Line Drawing" : traceMode === "ai_pattern" ? "AI Pattern Maker" : "Accurate Trace"}
                     </div>
                     {MODE_TIPS[traceMode].map((tip, i) => (
                       <div key={i} style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 5 }}>
                         <div style={{ width: 3, height: 3, borderRadius: "50%", flexShrink: 0, marginTop: 5,
-                          background: traceMode === "stroke" ? "#38bdf8" : traceMode === "halftone" ? "#fbbf24" : "#ec4899" }} />
+                          background: traceMode === "stroke" ? "#38bdf8" : traceMode === "halftone" || traceMode === "ai_pattern" ? "#fbbf24" : traceMode === "one_line" ? "#22d3ee" : "#ec4899" }} />
                         <span style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>{tip}</span>
                       </div>
                     ))}
@@ -1129,6 +1568,8 @@ export default function PhotoToDXFPage() {
                         { icon: "⊚", label: "Contour Art",      color: "#ec4899", desc: "Topographic iso-contour bands. Best for portraits and photos." },
                         { icon: "✏", label: "Stroke Trace",     color: "#38bdf8", desc: "Skeleton centerlines. Best for sketches, pen drawings, line art." },
                         { icon: "◉", label: "Halftone / Dot",   color: "#fbbf24", desc: "Dot grid from brightness. Best for CNC drilling, stipple art." },
+                        { icon: "∾", label: "One-Line Drawing", color: "#22d3ee", desc: "Single continuous path. Best for plotter engraving and artistic line work." },
+                        { icon: "◈", label: "AI Pattern Maker", color: "#fbbf24", desc: "Photo → decorative pattern. Contour relief, grooves, perforations, or geometric tile panels." },
                       ] as const).map(({ icon, label, color, desc }) => (
                         <div key={label} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
                           <div style={{ fontSize: 14, color, flexShrink: 0, paddingTop: 1 }}>{icon}</div>
@@ -1154,25 +1595,151 @@ export default function PhotoToDXFPage() {
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <div style={{
                   width: 22, height: 22, borderRadius: "50%", flexShrink: 0,
-                  background: traceMode === "halftone"
+                  background: traceMode === "halftone" || traceMode === "ai_pattern"
                     ? "linear-gradient(135deg, rgba(245,158,11,0.55), rgba(251,191,36,0.55))"
                     : "linear-gradient(135deg, rgba(236,72,153,0.55), rgba(168,85,247,0.55))",
-                  border: traceMode === "halftone" ? "1px solid rgba(245,158,11,0.45)" : "1px solid rgba(236,72,153,0.45)",
+                  border: traceMode === "halftone" || traceMode === "ai_pattern" ? "1px solid rgba(245,158,11,0.45)" : "1px solid rgba(236,72,153,0.45)",
                   display: "flex", alignItems: "center", justifyContent: "center",
                   fontSize: 10, fontWeight: 700,
-                  color: traceMode === "halftone" ? "#fde68a" : "#fbcfe8",
+                  color: traceMode === "halftone" || traceMode === "ai_pattern" ? "#fde68a" : "#fbcfe8",
                 }}>5</div>
                 <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.09em" }}>
                   Preview &amp; Export
                 </div>
                 <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
-                  <span className={`chip ${traceMode === "stroke" ? "chip-sky" : traceMode === "halftone" ? "chip-amber" : traceMode === "contour_art" ? "chip-red" : "chip-violet"}`}
-                    style={traceMode === "halftone" ? { background: "rgba(245,158,11,0.18)", color: "#fbbf24", borderColor: "rgba(245,158,11,0.3)" } : {}}>
+                  <span className={`chip ${traceMode === "stroke" ? "chip-sky" : traceMode === "halftone" || traceMode === "ai_pattern" ? "chip-amber" : traceMode === "one_line" ? "chip-sky" : traceMode === "contour_art" ? "chip-red" : "chip-violet"}`}
+                    style={traceMode === "halftone" || traceMode === "ai_pattern" ? { background: "rgba(245,158,11,0.18)", color: "#fbbf24", borderColor: "rgba(245,158,11,0.3)" }
+                      : traceMode === "one_line" ? { background: "rgba(34,211,238,0.12)", color: "#22d3ee", borderColor: "rgba(34,211,238,0.3)" } : {}}>
                     {modeChipLabel}
                   </span>
                   <span className="chip chip-green">✓ Done</span>
                 </div>
               </div>
+
+              {/* ── AI Pattern result ── */}
+              {aiPatternResult && (
+                <>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Stat label="Elements" value={aiPatternResult.n_elements.toLocaleString()} mode="ai_pattern" />
+                    <Stat label="Type"     value={aiPatternResult.pattern_type.replace(/_/g, " ")} mode="ai_pattern" />
+                    <Stat label="Image"    value={`${aiPatternResult.image_width}×${aiPatternResult.image_height}`} mode="ai_pattern" />
+                  </div>
+
+                  <div className="glass-sm" style={{ padding: "10px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.07em" }}>
+                      Pattern analysis
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                      {[
+                        { label: "Edge density",   value: `${(aiPatternResult.analysis.edge_density * 100).toFixed(1)}%` },
+                        { label: "Contrast",       value: aiPatternResult.analysis.contrast.toFixed(3) },
+                        { label: "Dominant angle", value: `${aiPatternResult.analysis.dominant_angle_deg.toFixed(1)}°` },
+                        ...Object.entries(aiPatternResult.n_by_layer).map(([layer, count]) => ({
+                          label: layer.replace("PATTERN_", "").replace(/_/g, " ").toLowerCase(),
+                          value: (count as number).toLocaleString(),
+                        })),
+                      ].map(({ label, value }) => (
+                        <div key={label} style={{ background: "rgba(245,158,11,0.06)", borderRadius: 7, padding: "7px 10px", border: "1px solid rgba(245,158,11,0.15)" }}>
+                          <div style={{ fontSize: 9, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: "#fbbf24", marginTop: 2 }}>{value}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* CNC Readiness panel */}
+                  {(() => {
+                    const fab = aiPatternResult.fabrication;
+                    const worst = fab.checks.reduce<"ok"|"warning"|"error">((acc, c) => {
+                      if (c.severity === "error")   return "error";
+                      if (c.severity === "warning" && acc !== "error") return "warning";
+                      return acc;
+                    }, "ok");
+                    const statusColor   = worst === "error" ? "#f87171" : worst === "warning" ? "#fb923c" : "#4ade80";
+                    const statusBg      = worst === "error" ? "rgba(239,68,68,0.12)" : worst === "warning" ? "rgba(251,146,60,0.12)" : "rgba(74,222,128,0.1)";
+                    const statusBorder  = worst === "error" ? "rgba(239,68,68,0.3)"  : worst === "warning" ? "rgba(251,146,60,0.3)"  : "rgba(74,222,128,0.2)";
+                    const statusLabel   = worst === "error" ? "Issues found" : worst === "warning" ? "Warnings" : "CNC-ready";
+                    const severityIcon  = (s: string) => s === "error" ? "✗" : s === "warning" ? "⚠" : "✓";
+                    const severityClr   = (s: string) => s === "error" ? "#f87171" : s === "warning" ? "#fb923c" : "#4ade80";
+                    return (
+                      <div className="glass-sm" style={{ padding: "10px 14px", display: "flex", flexDirection: "column", gap: 8, borderColor: statusBorder }}>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                          <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.07em" }}>
+                            CNC readiness
+                          </div>
+                          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                            <span style={{ fontSize: 10, fontWeight: 700, color: statusColor, background: statusBg, border: `1px solid ${statusBorder}`, borderRadius: 5, padding: "2px 7px" }}>
+                              {statusLabel}
+                            </span>
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          <div style={{ background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.18)", borderRadius: 7, padding: "5px 10px", flex: 1, minWidth: 130 }}>
+                            <div style={{ fontSize: 9, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Operation</div>
+                            <div style={{ fontSize: 12, fontWeight: 700, color: "#fbbf24", marginTop: 2 }}>{fab.operation_type}</div>
+                            <div style={{ fontSize: 9, color: "var(--text-muted)", marginTop: 1 }}>{fab.operation_label}</div>
+                          </div>
+                          <div style={{ background: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.18)", borderRadius: 7, padding: "5px 10px", flex: 1, minWidth: 80 }}>
+                            <div style={{ fontSize: 9, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Est. time</div>
+                            <div style={{ fontSize: 12, fontWeight: 700, color: "#fbbf24", marginTop: 2 }}>
+                              {fab.estimated_time_min >= 60
+                                ? `${Math.floor(fab.estimated_time_min / 60)}h ${Math.round(fab.estimated_time_min % 60)}m`
+                                : `${fab.estimated_time_min} min`}
+                            </div>
+                          </div>
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          {fab.checks.map((chk, i) => (
+                            <div key={i} style={{ display: "flex", gap: 7, alignItems: "flex-start" }}>
+                              <span style={{ fontSize: 12, color: severityClr(chk.severity), flexShrink: 0, lineHeight: 1.4 }}>{severityIcon(chk.severity)}</span>
+                              <span style={{ fontSize: 11, color: chk.severity === "ok" ? "var(--text-muted)" : severityClr(chk.severity), lineHeight: 1.4 }}>{chk.message}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {aiPatternResult.warnings.length > 0 && (
+                    <div className="glass-sm" style={{ padding: "9px 12px", borderColor: "rgba(251,146,60,0.3)" }}>
+                      {aiPatternResult.warnings.map((w, i) => (
+                        <div key={i} style={{ fontSize: 11, color: "#fb923c", display: "flex", gap: 6 }}>
+                          <span>⚠</span><span>{w}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <span style={{ fontSize: 11, color: "var(--text-subtle)" }}>Preview</span>
+                    <div className="seg-control" style={{ padding: 2 }}>
+                      {[
+                        { key: "original", label: "Original" },
+                        { key: "analysis", label: "Analysis" },
+                        { key: "pattern",  label: "Pattern"  },
+                      ].map(({ key, label }) => (
+                        <button key={key} className={`seg-btn${apPreviewMode === key ? " active" : ""}`}
+                          onClick={() => setApPreviewMode(key as typeof apPreviewMode)} type="button"
+                          style={{ padding: "4px 10px", fontSize: 11 }}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={{ borderRadius: 12, overflow: "hidden", background: "#06060f" }}>
+                    {apPreviewMode === "original" && imageUrl && (
+                      <img src={imageUrl} alt="original" style={{ width: "100%", height: "auto", display: "block" }} />
+                    )}
+                    {apPreviewMode === "analysis" && (
+                      <img src={aiPatternResult.analysis.brightness_map} alt="brightness map" style={{ width: "100%", height: "auto", display: "block", filter: "sepia(0.6) hue-rotate(10deg)" }} />
+                    )}
+                    {apPreviewMode === "pattern" && (
+                      <img src={aiPatternResult.preview_image} alt="pattern" style={{ width: "100%", height: "auto", display: "block" }} />
+                    )}
+                  </div>
+                </>
+              )}
 
               {/* ── Halftone result stats ── */}
               {halftoneResult && (
@@ -1180,18 +1747,121 @@ export default function PhotoToDXFPage() {
                   <div style={{ display: "flex", gap: 10 }}>
                     <Stat label="Circles"  value={halftoneResult.n_circles.toLocaleString()} mode="halftone" />
                     <Stat label="Image"    value={`${halftoneResult.image_width}×${halftoneResult.image_height}`} mode="halftone" />
-                    <Stat label="Density"  value={`${halftoneDensity}`} mode="halftone" />
+                    <Stat label="Open Area" value={`${(halftoneResult.open_area_pct ?? 0).toFixed(1)}%`} mode="halftone" />
+                  </div>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Stat label="Strength" value={`${halftoneResult.strength_label ?? "n/a"} ${halftoneResult.strength_score ?? 0}%`} mode="halftone" />
+                    <Stat label="Bridge" value={`${(halftoneResult.min_bridge_px ?? 0).toFixed(1)} px`} mode="halftone" />
+                    <Stat label="Mode" value={HALFTONE_PLACEMENT_LABELS[(halftoneResult.placement_mode as HalftonePlacementMode) || halftonePlacement] ?? HALFTONE_PLACEMENT_LABELS[halftonePlacement]} mode="halftone" />
+                  </div>
+                  <div className="glass-sm" style={{ padding: "9px 12px", borderRadius: 8 }}>
+                    <Toggle
+                      label="Density heatmap"
+                      sub="overlay brightness-driven placement pressure"
+                      value={showHalftoneHeatmap}
+                      onChange={setShowHalftoneHeatmap}
+                    />
                   </div>
                   <div style={{ borderRadius: 12, overflow: "hidden", background: "#06060f" }}>
                     {imageUrl && (
                       <div style={{ position: "relative" }}>
                         <img src={imageUrl} alt="original" style={{ width: "100%", height: "auto", display: "block", opacity: 0.12, filter: "grayscale(1)" }} />
                         <div style={{ position: "absolute", inset: 0 }}>
-                          <HalftoneSVG halftoneResult={halftoneResult} />
+                          <HalftoneSVG halftoneResult={halftoneResult} showHeatmap={showHalftoneHeatmap} />
                         </div>
                       </div>
                     )}
-                    {!imageUrl && <HalftoneSVG halftoneResult={halftoneResult} />}
+                    {!imageUrl && <HalftoneSVG halftoneResult={halftoneResult} showHeatmap={showHalftoneHeatmap} />}
+                  </div>
+                </>
+              )}
+
+              {/* ── One-line result ── */}
+              {oneLineResult && (
+                <>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Stat label="Points"  value={oneLineResult.n_points.toLocaleString()} mode="one_line" />
+                    <Stat label="Jumps"   value={String(oneLineResult.n_jumps)} mode="one_line" />
+                    <Stat label="Image"   value={`${oneLineResult.image_width}×${oneLineResult.image_height}`} mode="one_line" />
+                  </div>
+
+                  <div className="glass-sm" style={{ padding: "10px 14px", display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.07em" }}>
+                      One-line path metrics
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                      {[
+                        { label: "Total length",  value: `${oneLineResult.total_length_px.toLocaleString()} px` },
+                        { label: "Jump count",    value: `${oneLineResult.n_jumps} connector${oneLineResult.n_jumps !== 1 ? "s" : ""}` },
+                        { label: "Longest jump",  value: `${oneLineResult.longest_jump.toFixed(0)} px` },
+                      ].map(({ label, value }) => (
+                        <div key={label} style={{ background: "rgba(34,211,238,0.06)", borderRadius: 7, padding: "7px 10px", border: "1px solid rgba(34,211,238,0.15)" }}>
+                          <div style={{ fontSize: 9, color: "var(--text-subtle)", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</div>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: "#22d3ee", marginTop: 2 }}>{value}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <span style={{ fontSize: 11, color: "var(--text-subtle)" }}>Preview stages</span>
+                    <div className="seg-control" style={{ padding: 2 }}>
+                      {[
+                        { key: "original", label: "Original" },
+                        { key: "enhanced", label: "Enhanced" },
+                        { key: "skeleton", label: "Skeleton" },
+                        { key: "oneline",  label: "One Line" },
+                      ].map(({ key, label }) => (
+                        <button key={key} className={`seg-btn${olPreviewMode === key ? " active" : ""}`}
+                          onClick={() => setOlPreviewMode(key as typeof olPreviewMode)} type="button"
+                          style={{ padding: "4px 10px", fontSize: 11 }}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {olPreviewMode === "oneline" && (
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <span style={{ fontSize: 11, color: "var(--text-subtle)" }}>Show connection jumps</span>
+                      <button
+                        type="button"
+                        onClick={() => setShowJumps(v => !v)}
+                        style={{
+                          padding: "3px 12px", fontSize: 11, borderRadius: 6, cursor: "pointer",
+                          border: showJumps ? "1px solid rgba(251,146,60,0.55)" : "1px solid rgba(255,255,255,0.12)",
+                          background: showJumps ? "rgba(251,146,60,0.15)" : "rgba(255,255,255,0.04)",
+                          color: showJumps ? "#fb923c" : "var(--text-subtle)",
+                          fontWeight: 600, transition: "all 0.15s",
+                        }}
+                      >
+                        {showJumps ? "On" : "Off"}
+                      </button>
+                    </div>
+                  )}
+
+                  {olPreviewMode === "oneline" && (
+                    <div style={{ fontSize: 11, color: "var(--text-subtle)", marginTop: -10 }}>
+                      Animated one-line path — the complete image redrawn as a single continuous stroke.
+                    </div>
+                  )}
+                  {olPreviewMode === "skeleton" && (
+                    <div style={{ fontSize: 11, color: "var(--text-subtle)", marginTop: -10 }}>
+                      Skeletonized centerlines — 1-pixel wide spines from which the path is built.
+                    </div>
+                  )}
+
+                  <div style={{ borderRadius: 12, overflow: "hidden", background: "#06060f" }}>
+                    {olPreviewMode === "original" && imageUrl && (
+                      <img src={imageUrl} alt="original" style={{ width: "100%", height: "auto", display: "block" }} />
+                    )}
+                    {olPreviewMode === "enhanced" && (
+                      <img src={oneLineResult.cleaned_image} alt="enhanced" style={{ width: "100%", height: "auto", display: "block" }} />
+                    )}
+                    {olPreviewMode === "skeleton" && (
+                      <img src={oneLineResult.skeleton_image} alt="skeleton" style={{ width: "100%", height: "auto", display: "block" }} />
+                    )}
+                    {olPreviewMode === "oneline" && <OneLineSVG result={oneLineResult} showJumps={showJumps} />}
                   </div>
                 </>
               )}

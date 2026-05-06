@@ -193,11 +193,11 @@ _jobs: Dict[str, _Job] = {}
 
 @app.post(
     '/slice',
-    summary='Slice an STL file into boards',
+    summary='Slice a 3D mesh into boards',
     response_description='Server-Sent Events stream of progress and result',
 )
 async def slice_endpoint(
-    file:           UploadFile        = File(...,   description='STL file to slice'),
+    file:           UploadFile        = File(...,   description='3D model file to slice (STL or OBJ)'),
     axis:           str               = Form('y',   description="Stacking axis: 'x', 'y', or 'z'"),
     slab_mode:      str               = Form('envelope',
                                              description="Profile mode: 'envelope' or 'best_sample'"),
@@ -213,7 +213,7 @@ async def slice_endpoint(
     edge_margin_mm: Optional[float]   = Form(None,  description='Hole edge margin mm; omit for auto 20 %'),
 ) -> StreamingResponse:
     """
-    Upload an STL file and slicing parameters.
+    Upload a 3D mesh file and slicing parameters.
 
     Returns a **Server-Sent Events** stream.  Connect with `EventSource` or
     any SSE client; each `data:` line is a JSON object:
@@ -227,8 +227,14 @@ async def slice_endpoint(
     The `result` payload from the `result` event can be sent directly to
     `POST /export_dxf` to generate the DXF file.
     """
+    ext = os.path.splitext(file.filename or '')[1].lower() or '.stl'
+    if ext not in ('.stl', '.obj'):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Accepted formats: .stl, .obj",
+        )
+
     # Buffer upload to a temp file so the background thread can read it safely.
-    ext     = os.path.splitext(file.filename or '')[1] or '.stl'
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
     try:
         contents = await file.read()
@@ -677,7 +683,7 @@ def _apply_prompt_override(result: dict, prompt: str) -> dict:
     return result
 
 
-def _halftone_grid(
+def _halftone_grid_legacy(
     arr:        "_np.ndarray",  # float [0,1] grayscale, dark=subject
     density:    int   = 30,     # grid cells along the longer axis
     min_radius: float = 0.5,    # min circle radius in image pixels
@@ -685,6 +691,9 @@ def _halftone_grid(
     contrast:   float = 1.5,    # contrast multiplier before mapping
     invert:     bool  = False,  # swap bright/dark mapping
     gamma:      float = 0.8,    # gamma < 1 lifts shadow detail before mapping
+    placement_mode: str = 'organic_density',
+    randomness: float = 0.55,
+    density_sensitivity: float = 1.25,
 ) -> list:
     """
     Divide image into a grid; map mean cell brightness → circle radius.
@@ -740,6 +749,196 @@ def _halftone_grid(
                 ])
 
     return circles
+
+
+def _halftone_grid(
+    arr: "_np.ndarray",
+    density: int = 30,
+    min_radius: float = 0.5,
+    max_radius: float = 8.0,
+    contrast: float = 1.5,
+    invert: bool = False,
+    gamma: float = 0.8,
+    placement_mode: str = 'organic_density',
+    randomness: float = 0.55,
+    density_sensitivity: float = 1.25,
+) -> list:
+    """Image-driven halftone holes with fabrication-aware spacing."""
+    import math as _math
+    import random as _random
+
+    h, w = arr.shape
+    placement_mode = (placement_mode or 'organic_density').strip().lower()
+    placement_mode = {
+        'organic': 'organic_density',
+        'organic density': 'organic_density',
+        'hex': 'hex_packing',
+        'hex packing': 'hex_packing',
+        'flow': 'flow_field',
+        'flow field': 'flow_field',
+    }.get(placement_mode, placement_mode)
+    if placement_mode not in {'organic_density', 'hex_packing', 'flow_field'}:
+        placement_mode = 'organic_density'
+    randomness = max(0.0, min(1.0, float(randomness)))
+    density_sensitivity = max(0.35, min(3.0, float(density_sensitivity)))
+
+    arr_g = _np.clip(arr, 1e-6, 1.0) ** gamma
+    mid = float(_np.median(arr_g))
+    boosted = _np.clip((arr_g - mid) * contrast + mid, 0.0, 1.0)
+    if invert:
+        boosted = 1.0 - boosted
+
+    edge_map = _sk_feature.canny(arr, sigma=1.5).astype(float)
+    edge_soft = _sk_filters.gaussian(edge_map, sigma=max(1.5, max(w, h) / (density * 4)))
+    edge_soft = edge_soft / max(float(edge_soft.max()), 1e-6)
+
+    r_span = max_radius - min_radius
+    base_step = max(2.0, max(w, h) / max(5, density))
+    base_bridge = max(1.0, min_radius * 0.85, base_step * 0.10)
+    edge_margin = max_radius + base_bridge * 0.5
+    darkness = _np.clip((1.0 - boosted) ** density_sensitivity, 0.0, 1.0)
+
+    circles: list = []
+    bin_size = max(1.0, max_radius * 2.0 + base_bridge)
+    bins: dict = {}
+
+    def sample(map_arr: "_np.ndarray", row: float, col: float) -> float:
+        rr = int(min(h - 1, max(0, round(row))))
+        cc = int(min(w - 1, max(0, round(col))))
+        return float(map_arr[rr, cc])
+
+    def radius_for(row: float, col: float, tone: Optional[float] = None) -> float:
+        t = sample(darkness, row, col) if tone is None else tone
+        e = sample(edge_soft, row, col)
+        return max(min_radius, min(max_radius, min_radius + (t ** 0.72) * r_span + e * r_span * 0.10))
+
+    def add_circle(row: float, col: float, radius: float, bridge: float) -> bool:
+        if row < edge_margin or col < edge_margin or row > h - edge_margin or col > w - edge_margin:
+            return False
+        br, bc = int(row // bin_size), int(col // bin_size)
+        for rr in range(br - 1, br + 2):
+            for cc in range(bc - 1, bc + 2):
+                for orow, ocol, orad in bins.get((rr, cc), []):
+                    if _math.hypot(row - orow, col - ocol) < radius + orad + bridge:
+                        return False
+        circles.append([round(row, 2), round(col, 2), round(radius, 3)])
+        bins.setdefault((br, bc), []).append((row, col, radius))
+        return True
+
+    rng = _random.Random(1337)
+
+    if placement_mode == 'hex_packing':
+        step = max(min_radius * 2.0 + base_bridge, base_step)
+        y_step = step * _math.sqrt(3.0) * 0.5
+        row_i = 0
+        y = edge_margin
+        while y <= h - edge_margin:
+            x = edge_margin + (step * 0.5 if row_i % 2 else 0.0)
+            while x <= w - edge_margin:
+                tone = sample(darkness, y, x)
+                keep = min(1.0, 0.10 + tone * 1.05 + sample(edge_soft, y, x) * 0.20)
+                if rng.random() < keep:
+                    jitter = step * 0.10 * randomness
+                    row = y + rng.uniform(-jitter, jitter)
+                    col = x + rng.uniform(-jitter, jitter)
+                    add_circle(row, col, radius_for(row, col, tone), base_bridge)
+                x += step
+            row_i += 1
+            y += y_step
+        return circles
+
+    if placement_mode == 'flow_field':
+        gy = _sk_filters.scharr_v(boosted)
+        gx = _sk_filters.scharr_h(boosted)
+        grad = _np.hypot(gx, gy)
+        grad = grad / max(float(grad.max()), 1e-6)
+        step = max(min_radius * 2.0 + base_bridge, base_step * 0.92)
+        for y0 in _np.arange(edge_margin, h - edge_margin, step):
+            phase = rng.uniform(-step * 0.45, step * 0.45) * randomness
+            for x0 in _np.arange(edge_margin + phase, w - edge_margin, step):
+                row, col = float(y0), float(x0)
+                rr = int(min(h - 1, max(0, round(row))))
+                cc = int(min(w - 1, max(0, round(col))))
+                g = float(grad[rr, cc])
+                vx, vy = -float(gy[rr, cc]), float(gx[rr, cc])
+                mag = _math.hypot(vx, vy) or 1.0
+                flow_shift = (g * 1.25 + 0.15) * step * randomness
+                row += (vy / mag) * rng.uniform(-flow_shift, flow_shift)
+                col += (vx / mag) * rng.uniform(-flow_shift, flow_shift)
+                tone = sample(darkness, row, col)
+                keep = min(1.0, 0.06 + tone * 0.98 + g * 0.35)
+                if rng.random() < keep:
+                    add_circle(row, col, radius_for(row, col, tone), base_bridge)
+        return circles
+
+    max_attempts = int(min(260000, max(2500, density * density * 24)))
+    accepted_target = int(min(45000, max(200, density * density * 2.8)))
+    for _ in range(max_attempts):
+        if len(circles) >= accepted_target:
+            break
+        row = rng.uniform(edge_margin, h - edge_margin)
+        col = rng.uniform(edge_margin, w - edge_margin)
+        tone = sample(darkness, row, col)
+        probability = min(1.0, 0.015 + tone * 1.15 + sample(edge_soft, row, col) * 0.20)
+        if rng.random() > probability:
+            continue
+        local_bridge = base_bridge + (1.0 - tone) * base_step * (0.35 + randomness * 0.35)
+        add_circle(row, col, radius_for(row, col, tone), local_bridge)
+
+    return circles
+
+
+def _halftone_density_heatmap(arr: "_np.ndarray", contrast: float, invert: bool, sensitivity: float) -> str:
+    arr_g = _np.clip(arr, 1e-6, 1.0) ** 0.8
+    mid = float(_np.median(arr_g))
+    boosted = _np.clip((arr_g - mid) * contrast + mid, 0.0, 1.0)
+    if invert:
+        boosted = 1.0 - boosted
+    d = _np.clip((1.0 - boosted) ** max(0.35, min(3.0, sensitivity)), 0.0, 1.0)
+    rgb = _np.zeros((*d.shape, 3), dtype=_np.uint8)
+    rgb[..., 0] = _np.clip(255 * d, 0, 255).astype(_np.uint8)
+    rgb[..., 1] = _np.clip(190 * (1.0 - _np.abs(d - 0.55) * 1.8), 0, 190).astype(_np.uint8)
+    rgb[..., 2] = _np.clip(180 * (1.0 - d), 0, 180).astype(_np.uint8)
+    return _encode_png(rgb)
+
+
+def _halftone_fabrication_metrics(circles: list, w: int, h: int, min_radius: float, max_radius: float) -> dict:
+    import math as _math
+    panel_area = max(1.0, float(w * h))
+    open_area = sum(_math.pi * float(c[2]) * float(c[2]) for c in circles if len(c) >= 3)
+    open_pct = max(0.0, min(95.0, open_area / panel_area * 100.0))
+    min_bridge = None
+    bin_size = max(1.0, max_radius * 2.5)
+    bins: dict = {}
+    for idx, c in enumerate(circles):
+        row, col, _ = map(float, c[:3])
+        bins.setdefault((int(row // bin_size), int(col // bin_size)), []).append(idx)
+    for i, a in enumerate(circles):
+        ar, ac, rad_a = map(float, a[:3])
+        br_i, bc_i = int(ar // bin_size), int(ac // bin_size)
+        for rr in range(br_i - 1, br_i + 2):
+            for cc in range(bc_i - 1, bc_i + 2):
+                for j in bins.get((rr, cc), []):
+                    if j <= i:
+                        continue
+                    br, bc, rad_b = map(float, circles[j][:3])
+                    gap = _math.hypot(ar - br, ac - bc) - rad_a - rad_b
+                    if min_bridge is None or gap < min_bridge:
+                        min_bridge = gap
+    if min_bridge is None:
+        min_bridge = 0.0
+    target_bridge = max(1.0, min_radius * 0.85)
+    bridge_score = max(0.0, min(1.0, min_bridge / max(target_bridge, 1e-6)))
+    open_score = 1.0 if open_pct <= 35.0 else max(0.0, 1.0 - (open_pct - 35.0) / 35.0)
+    strength_score = int(round(100.0 * min(bridge_score, open_score)))
+    strength = 'High' if strength_score >= 72 else 'Moderate' if strength_score >= 45 else 'Low'
+    return {
+        'open_area_pct': round(open_pct, 1),
+        'min_bridge_px': round(float(min_bridge), 2),
+        'max_hole_diameter_px': round(float(max_radius) * 2.0, 2),
+        'strength_score': strength_score,
+        'strength_label': strength,
+    }
 
 
 def _chaikin(pts: "_np.ndarray", iters: int = 1) -> "_np.ndarray":
@@ -1790,6 +1989,9 @@ async def photo_halftone(
     contrast:   float      = Form(1.5,  description='Contrast boost before mapping (0.5–3.0)'),
     blur:       float      = Form(1.0,  description='Pre-blur radius (0–5)'),
     invert:     bool       = Form(False,description='Invert: bright areas → large circles'),
+    placement_mode: str    = Form('organic_density', description='organic_density, hex_packing, or flow_field'),
+    randomness: float      = Form(0.55, description='Organic jitter/randomness (0-1)'),
+    density_sensitivity: float = Form(1.25, description='Brightness-to-density response (0.35-3.0)'),
 ):
     raw = await file.read()
     if len(raw) > 20 * 1024 * 1024:
@@ -1815,8 +2017,15 @@ async def photo_halftone(
     min_radius = max(0.1, min(20.0, min_radius))
     max_radius = max(min_radius + 0.1, min(50.0, max_radius))
     contrast   = max(0.1, min(5.0,  contrast))
+    randomness = max(0.0, min(1.0, randomness))
+    density_sensitivity = max(0.35, min(3.0, density_sensitivity))
 
-    circles = _halftone_grid(arr, density, min_radius, max_radius, contrast, invert)
+    circles = _halftone_grid(
+        arr, density, min_radius, max_radius, contrast, invert,
+        placement_mode=placement_mode,
+        randomness=randomness,
+        density_sensitivity=density_sensitivity,
+    )
 
     # Build a preview image: draw filled circles on white canvas
     import math as _math2
@@ -1830,13 +2039,18 @@ async def photo_halftone(
                 if _math2.hypot(rp - cr, cp - cc) <= r:
                     canvas[rp, cp] = 0
     preview_b64 = _encode_png(canvas)
+    metrics = _halftone_fabrication_metrics(circles, w, h, min_radius, max_radius)
+    heatmap_b64 = _halftone_density_heatmap(arr, contrast, invert, density_sensitivity)
 
     return JSONResponse({
         'circles':      circles,
         'preview_image': preview_b64,
+        'density_heatmap': heatmap_b64,
         'n_circles':    len(circles),
         'image_width':  w,
         'image_height': h,
+        'placement_mode': placement_mode,
+        **metrics,
     })
 
 
@@ -2055,6 +2269,279 @@ async def photo_export(body: PhotoExportRequest, background_tasks: BackgroundTas
             continue
         pts = [(float(p[1]) * s, float(h - p[0]) * s) for p in contour]
         msp.add_lwpolyline(pts, close=True)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
+    os.close(tmp_fd)
+    doc.saveas(tmp_path)
+    background_tasks.add_task(os.unlink, tmp_path)
+
+    return FileResponse(
+        tmp_path,
+        media_type='application/octet-stream',
+        filename=body.filename,
+        headers={'Content-Disposition': f'attachment; filename="{body.filename}"'},
+    )
+
+
+# ── One-Line Drawing ─────────────────────────────────────────────────────────
+
+_SKEL_OFFSETS = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+
+
+def _trace_skel_chains(skel: "_np.ndarray", step: int) -> list:
+    """Extract ordered pixel chains from a skeletonized image, downsampled by step."""
+    from skimage.measure import label as _lbl
+    labeled = _lbl(skel, connectivity=2)
+    chains: list = []
+
+    for cid in range(1, int(labeled.max()) + 1):
+        ys, xs = _np.where(labeled == cid)
+        if len(ys) < 2:
+            continue
+
+        pix_set: set = set(zip(ys.tolist(), xs.tolist()))
+
+        # Find an endpoint (degree-1 pixel) to start the walk
+        start = None
+        for p in pix_set:
+            if sum(1 for dr, dc in _SKEL_OFFSETS if (p[0]+dr, p[1]+dc) in pix_set) == 1:
+                start = p
+                break
+        if start is None:
+            start = (int(ys[0]), int(xs[0]))
+
+        visited: set = {start}
+        chain: list = [list(start)]
+        cur = start
+
+        while True:
+            cands = [(cur[0]+dr, cur[1]+dc)
+                     for dr, dc in _SKEL_OFFSETS
+                     if (cur[0]+dr, cur[1]+dc) in pix_set
+                     and (cur[0]+dr, cur[1]+dc) not in visited]
+            if not cands:
+                break
+            # Prefer continuing in same direction
+            if len(chain) >= 2:
+                dr_p = cur[0] - chain[-2][0]
+                dc_p = cur[1] - chain[-2][1]
+                best_nb = min(cands,
+                              key=lambda p: abs(p[0]-cur[0]-dr_p) + abs(p[1]-cur[1]-dc_p))
+            else:
+                best_nb = cands[0]
+            visited.add(best_nb)
+            chain.append(list(best_nb))
+            cur = best_nb
+
+        if step > 1 and len(chain) > 2:
+            sampled = chain[::step]
+            if sampled[-1] != chain[-1]:
+                sampled.append(chain[-1])
+            chain = sampled
+
+        if len(chain) >= 2:
+            chains.append(chain)
+
+    return chains
+
+
+def _greedy_connect_chains(chains: list, jump_penalty: float) -> list:
+    """
+    Greedy nearest-neighbor tour through all chains.
+
+    Returns a list of ``(points, is_jump)`` segment tuples.
+    Real chain segments have ``is_jump=False``; the two-point connector
+    between consecutive chains has ``is_jump=True``.
+    """
+    import math
+
+    remaining = list(range(len(chains)))
+    start_i = max(remaining, key=lambda i: len(chains[i]))
+    remaining.remove(start_i)
+
+    segments: list = [(list(chains[start_i]), False)]
+
+    def _end_heading(chain: list, from_end: bool) -> tuple:
+        if len(chain) < 2:
+            return (0.0, 0.0)
+        p1, p2 = (chain[-2], chain[-1]) if from_end else (chain[1], chain[0])
+        dr, dc = p2[0] - p1[0], p2[1] - p1[1]
+        d = math.hypot(dr, dc)
+        return (dr / d, dc / d) if d > 1e-9 else (0.0, 0.0)
+
+    cur_end  = segments[-1][0][-1]
+    cur_head = _end_heading(chains[start_i], True)
+
+    while remaining:
+        best_score, best_idx, best_rev = float('inf'), -1, False
+        for i in remaining:
+            c = chains[i]
+            for rev in (False, True):
+                entry = c[0] if not rev else c[-1]
+                d = math.hypot(entry[0] - cur_end[0], entry[1] - cur_end[1])
+                if jump_penalty > 0 and d > 1e-9:
+                    dir_r = (entry[0] - cur_end[0]) / d
+                    dir_c = (entry[1] - cur_end[1]) / d
+                    cos_a = cur_head[0] * dir_r + cur_head[1] * dir_c
+                    score = d * (1.0 + jump_penalty * max(0.0, -cos_a) * 1.5)
+                else:
+                    score = d
+                if score < best_score:
+                    best_score, best_idx, best_rev = score, i, rev
+
+        chosen = list(chains[best_idx])
+        if best_rev:
+            chosen = list(reversed(chosen))
+
+        # Two-point jump connector: [current_end → chosen_start]
+        segments.append(([cur_end, chosen[0]], True))
+        segments.append((chosen, False))
+
+        cur_end  = chosen[-1]
+        cur_head = _end_heading(chosen, True)
+        remaining.remove(best_idx)
+
+    return segments
+
+
+@app.post('/photo-to-dxf/one-line', summary='Generate one-line drawing from image')
+async def photo_one_line(
+    file:         UploadFile = File(...,    description='Image file'),
+    detail:       float      = Form(5.0,    description='Detail level 1–10'),
+    simplify:     float      = Form(3.0,    description='RDP epsilon'),
+    jump_penalty: float      = Form(0.5,    description='Jump direction penalty 0–1'),
+    blur:         float      = Form(1.0,    description='Pre-blur 0–5'),
+    invert:       bool       = Form(False,  description='Invert dark/light'),
+) -> JSONResponse:
+    """Convert an image to a single continuous line path for plotter/CNC engraving."""
+    import math
+    from skimage.filters import threshold_sauvola, threshold_otsu
+    from skimage.morphology import skeletonize, closing, disk, remove_small_objects
+    from PIL import Image as _PILImg, ImageDraw as _IDraw
+
+    contents = await file.read()
+    pil_img  = _PIL.open(_io.BytesIO(contents)).convert('L')
+
+    max_dim = 600
+    iw, ih  = pil_img.width, pil_img.height
+    if max(iw, ih) > max_dim:
+        s = max_dim / max(iw, ih)
+        pil_img = pil_img.resize((int(iw * s), int(ih * s)), _PIL.LANCZOS)
+
+    w, h = pil_img.width, pil_img.height
+    arr  = _np.array(pil_img, dtype=float) / 255.0
+
+    enhanced = _sk_exp.equalize_adapthist(arr, clip_limit=0.015)
+    sigma_sp = max(0.5, 1.8 - (detail - 1.0) * 0.08)
+    denoised = _sk_rest.denoise_bilateral(enhanced, sigma_color=0.10,
+                                          sigma_spatial=sigma_sp, channel_axis=None)
+    if blur > 0:
+        denoised = _sk_filters.gaussian(denoised, sigma=blur * 0.5)
+
+    k_sauv = max(0.04, 0.28 - (detail - 5.0) * 0.02)
+    win    = int(max(15, min(51, (h + w) // 55)) | 1)
+    b_sauv = denoised < threshold_sauvola(denoised, window_size=win, k=k_sauv)
+    b_otsu = denoised < threshold_otsu(denoised)
+    binary = b_sauv | b_otsu
+    if invert:
+        binary = ~binary
+
+    min_blob = max(2, int(h * w // 80000))
+    binary   = remove_small_objects(binary, max_size=max(0, min_blob - 1))
+    binary   = closing(binary, disk(1))
+    skel     = skeletonize(binary)
+
+    step   = max(1, int(11 - detail))
+    chains = _trace_skel_chains(skel, step)
+    if not chains:
+        return JSONResponse({'error': 'No paths found — try adjusting Detail or Invert.'}, status_code=422)
+
+    raw_segments = _greedy_connect_chains(chains, jump_penalty)
+
+    # Apply RDP per real segment; concatenate into a flat path tracking jump indices.
+    flat_path:    list = []
+    jump_indices: list = []   # i where flat_path[i] → flat_path[i+1] is a jump connector
+
+    for pts, is_jump in raw_segments:
+        if not pts:
+            continue
+        if not is_jump and simplify > 0 and len(pts) > 2:
+            pts_np   = _np.array(pts, dtype=float)
+            idx_list = _rdp(pts_np, simplify)
+            pts      = [pts[k] for k in idx_list]
+        if is_jump:
+            # pts = [prev_end, next_start]; prev_end already in flat_path
+            if flat_path:
+                jump_indices.append(len(flat_path) - 1)
+                flat_path.append(pts[-1])
+            else:
+                flat_path.extend(pts)
+        else:
+            if flat_path:
+                flat_path.extend(pts[1:])   # first pt equals previous jump end
+            else:
+                flat_path.extend(pts)
+
+    path = flat_path
+
+    # Preview: real segments in cyan, jump connectors in dim orange
+    prev_img = _PILImg.new('RGB', (w, h), (6, 6, 15))
+    draw     = _IDraw.Draw(prev_img)
+    jump_set = set(jump_indices)
+    for i in range(len(path) - 1):
+        r1, c1 = int(path[i][0]),   int(path[i][1])
+        r2, c2 = int(path[i+1][0]), int(path[i+1][1])
+        color  = (100, 60, 30) if i in jump_set else (34, 211, 238)
+        draw.line([(c1, r1), (c2, r2)], fill=color, width=1)
+    buf = _io.BytesIO()
+    prev_img.save(buf, 'PNG')
+    preview_b64 = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+
+    n_jumps   = len(jump_indices)
+    jump_lens = [
+        math.hypot(path[i+1][0]-path[i][0], path[i+1][1]-path[i][1])
+        for i in jump_indices if i + 1 < len(path)
+    ]
+    longest_jump = round(max(jump_lens), 1) if jump_lens else 0.0
+    total_len    = sum(
+        math.hypot(path[i+1][0]-path[i][0], path[i+1][1]-path[i][1])
+        for i in range(len(path) - 1)
+    ) if len(path) > 1 else 0.0
+
+    return JSONResponse({
+        'path':             path,
+        'jump_indices':     jump_indices,
+        'n_points':         len(path),
+        'n_jumps':          n_jumps,
+        'longest_jump':     longest_jump,
+        'total_length_px':  round(total_len, 1),
+        'preview_image':    preview_b64,
+        'skeleton_image':   _encode_png((skel.astype(_np.uint8) * 255)),
+        'cleaned_image':    _encode_png((enhanced * 255).astype(_np.uint8)),
+        'image_width':      w,
+        'image_height':     h,
+    })
+
+
+class OneLineExportRequest(BaseModel):
+    path:         List[List[float]]
+    image_width:  int
+    image_height: int
+    scale:        float = 1.0
+    filename:     str   = 'one-line.dxf'
+
+
+@app.post('/photo-to-dxf/export-one-line', summary='Export one-line path as DXF (single LWPOLYLINE on layer ONE_LINE)')
+async def photo_export_one_line(body: OneLineExportRequest, background_tasks: BackgroundTasks):
+    import ezdxf
+    doc = ezdxf.new('R2010')
+    doc.layers.new(name='ONE_LINE', dxfattribs={'color': 4})   # cyan
+    msp = doc.modelspace()
+
+    h, s = body.image_height, body.scale
+    if len(body.path) >= 2:
+        pts = [(float(p[1]) * s, float(h - p[0]) * s) for p in body.path]
+        msp.add_lwpolyline(pts, dxfattribs={'layer': 'ONE_LINE'})
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix='.dxf')
     os.close(tmp_fd)
@@ -3250,6 +3737,531 @@ async def multi_wrap_dxf(body: MultiWrapDxfRequest, background_tasks: Background
     return FileResponse(tmp_path, media_type='application/octet-stream',
                         filename=fn,
                         headers={'Content-Disposition': f'attachment; filename="{fn}"'})
+
+
+# ── AI Pattern Maker ──────────────────────────────────────────────────────────
+
+def _analyze_for_pattern(img_gray: '_np.ndarray') -> dict:
+    """Extract image features used to drive pattern generation."""
+    from scipy.ndimage import gaussian_filter, sobel
+    edges         = _sk_feature.canny(img_gray, sigma=2.0)
+    edge_density  = float(edges.mean())
+    contrast      = float(img_gray.std())
+    dy            = sobel(img_gray, axis=0)
+    dx            = sobel(img_gray, axis=1)
+    magnitudes    = _np.hypot(dx, dy)
+    angles        = _np.arctan2(dy, dx) % _np.pi
+    hist, bins    = _np.histogram(angles.ravel(), bins=36, weights=magnitudes.ravel())
+    best          = int(hist.argmax())
+    dominant_ang  = float((bins[best] + bins[best + 1]) / 2 * 180.0 / _np.pi)
+    sigma_bm      = max(3.0, min(img_gray.shape) * 0.05)
+    brightness_map = gaussian_filter(img_gray, sigma=sigma_bm)
+    return {
+        'edge_density':       edge_density,
+        'contrast':           contrast,
+        'dominant_angle_deg': dominant_ang,
+        'brightness_map':     brightness_map,
+    }
+
+
+def _gen_contour_relief(img_gray, detail, style, min_spacing, max_elements):
+    """Luminance iso-contour lines at evenly-spaced brightness levels."""
+    from scipy.ndimage import gaussian_filter
+    n_levels = max(3, int(detail * 2))
+    levels   = _np.linspace(0.08, 0.92, n_levels)
+    sigma    = 1.5 if style in ('clean', 'geometric') else 3.0
+    rdp_eps  = 0.8 if style in ('clean', 'geometric') else 2.5
+    blurred  = gaussian_filter(img_gray, sigma=sigma)
+    elements, warnings = [], []
+    for li, level in enumerate(levels):
+        for contour in _sk_measure.find_contours(blurred, level):
+            if len(contour) < 3:
+                continue
+            idx = _rdp(_np.array(contour, dtype=float), rdp_eps)
+            pts = [list(contour[k]) for k in idx]
+            if len(pts) < 2:
+                continue
+            perim = sum(
+                _np.hypot(pts[j+1][0] - pts[j][0], pts[j+1][1] - pts[j][1])
+                for j in range(len(pts) - 1)
+            )
+            if perim < min_spacing * 2:
+                continue
+            elements.append({'type': 'polyline', 'points': pts, 'layer': 'PATTERN_CUT', 'level': li})
+            if len(elements) >= max_elements:
+                warnings.append(f'Element limit ({max_elements}) reached — some contours omitted')
+                return elements, warnings
+    return elements, warnings
+
+
+def _gen_groove_pattern(img_gray, detail, style, min_spacing, max_elements, analysis):
+    """Horizontal scan-line grooves with brightness-modulated spacing."""
+    from scipy.ndimage import gaussian_filter
+    h, w     = img_gray.shape
+    smooth   = gaussian_filter(img_gray, sigma=max(1.5, min_spacing * 0.3))
+    min_step = float(min_spacing)
+    max_step = max(min_step * 1.5, min_step * (5.5 - detail * 0.4))
+    elements, warnings = [], []
+    if style in ('clean', 'geometric'):
+        y = min_step / 2
+        while y < h:
+            row        = int(_np.clip(y, 0, h - 1))
+            brightness = float(smooth[row, :].mean())
+            elements.append({'type': 'line', 'x1': 0.0, 'y1': float(y),
+                             'x2': float(w), 'y2': float(y), 'layer': 'PATTERN_GROOVE'})
+            if len(elements) >= max_elements:
+                warnings.append('Element limit reached')
+                break
+            y += max(min_step, min_step + brightness * (max_step - min_step))
+    else:
+        freq   = 2.0 * _np.pi / max(1.0, min_spacing * 4 + detail * 2)
+        x_step = max(1, int(min_spacing * 0.5))
+        y      = min_step / 2
+        while y < h:
+            row          = int(_np.clip(y, 0, h - 1))
+            brightness_r = smooth[row, :]
+            pts = []
+            for x in range(0, int(w) + 1, x_step):
+                col     = min(x, w - 1)
+                local_b = float(brightness_r[col])
+                amp     = (1.0 - local_b) * min_spacing * 0.6
+                pts.append([float(y + amp * _np.sin(x * freq)), float(x)])
+            if len(pts) >= 2:
+                elements.append({'type': 'polyline', 'points': pts, 'layer': 'PATTERN_GROOVE', 'level': 0})
+            avg_b = float(brightness_r.mean())
+            y    += max(min_step, min_step + avg_b * (max_step - min_step))
+            if len(elements) >= max_elements:
+                warnings.append('Element limit reached')
+                break
+    return elements, warnings
+
+
+def _gen_perforation(img_gray, detail, style, min_spacing, min_hole_size, max_elements):
+    """Grid of circles sized by local brightness — drilling/perforation pattern."""
+    from scipy.ndimage import gaussian_filter
+    h, w    = img_gray.shape
+    smooth  = gaussian_filter(img_gray, sigma=max(1.5, min_spacing * 0.4))
+    cell    = float(min_spacing)
+    max_r   = cell * 0.45
+    min_r   = max(min_hole_size / 2.0, 0.5)
+    use_hex = style in ('organic', 'facade')
+    elements, warnings = [], []
+    row_i, cy = 0, cell / 2
+    while cy < h:
+        cx_off = (cell / 2) if (use_hex and row_i % 2 == 1) else 0.0
+        cx     = cx_off + cell / 2
+        while cx < w:
+            ri = int(_np.clip(cy, 0, h - 1))
+            ci = int(_np.clip(cx, 0, w - 1))
+            brightness = float(smooth[ri, ci])
+            r = min_r + (1.0 - brightness) * (max_r - min_r)
+            if r >= min_r:
+                elements.append({'type': 'circle', 'cx': float(cx), 'cy': float(cy),
+                                 'r': round(r, 2), 'layer': 'PATTERN_HOLES'})
+                if len(elements) >= max_elements:
+                    warnings.append('Element limit reached')
+                    break
+            cx += cell
+        cy += cell;  row_i += 1
+        if len(elements) >= max_elements:
+            break
+    return elements, warnings
+
+
+def _gen_facade(img_gray, detail, style, min_spacing, max_elements, panel_shape):
+    """Geometric tiling where cells are drawn or scaled according to brightness."""
+    from scipy.ndimage import gaussian_filter
+    h, w      = img_gray.shape
+    smooth    = gaussian_filter(img_gray, sigma=max(2.0, min_spacing * 0.5))
+    threshold = 0.5
+    elements, warnings = [], []
+
+    def _sample(cy, cx):
+        return float(smooth[int(_np.clip(cy, 0, h - 1)), int(_np.clip(cx, 0, w - 1))])
+
+    if panel_shape == 'hexagon':
+        R     = min_spacing * 0.55
+        col_w = R * _np.sqrt(3)
+        row_h = R * 1.5
+
+        def _hex(cx, cy, r):
+            pts = [[cy + r * _np.sin(_np.radians(60 * k)),
+                    cx + r * _np.cos(_np.radians(60 * k))] for k in range(6)]
+            pts.append(pts[0])
+            return pts
+
+        row_i, cy = 0, R
+        while cy - R < h + R:
+            cx = ((col_w / 2) if row_i % 2 == 1 else 0.0) + col_w / 2
+            while cx - R < w + R:
+                b = _sample(cy, cx)
+                if style in ('clean', 'geometric'):
+                    if b < threshold:
+                        elements.append({'type': 'polyline', 'points': _hex(cx, cy, R),
+                                         'layer': 'PATTERN_CUT', 'level': 0})
+                else:
+                    sr = R * (0.25 + (1 - b) * 0.75)
+                    if sr >= min_spacing * 0.12:
+                        elements.append({'type': 'polyline', 'points': _hex(cx, cy, sr),
+                                         'layer': 'PATTERN_CUT', 'level': 0})
+                cx += col_w
+                if len(elements) >= max_elements:
+                    break
+            cy += row_h;  row_i += 1
+            if len(elements) >= max_elements:
+                break
+
+    elif panel_shape == 'triangle':
+        side  = min_spacing * 1.2
+        h_tri = side * _np.sqrt(3) / 2
+        hs    = side / 2
+
+        def _tri(cx, cy, up):
+            if up:
+                return [[cy, cx - hs], [cy, cx + hs], [cy - h_tri, cx], [cy, cx - hs]]
+            return [[cy, cx - hs], [cy, cx + hs], [cy + h_tri, cx], [cy, cx - hs]]
+
+        cy = 0.0
+        while cy < h + h_tri:
+            cx = 0.0
+            while cx < w + side:
+                for up in (True, False):
+                    pts = _tri(cx, cy, up)
+                    ccy = (pts[0][0] + pts[1][0] + pts[2][0]) / 3
+                    ccx = (pts[0][1] + pts[1][1] + pts[2][1]) / 3
+                    if _sample(ccy, ccx) < threshold:
+                        elements.append({'type': 'polyline', 'points': pts,
+                                         'layer': 'PATTERN_CUT', 'level': 0})
+                    if len(elements) >= max_elements:
+                        break
+                cx += side
+                if len(elements) >= max_elements:
+                    break
+            cy += h_tri
+            if len(elements) >= max_elements:
+                break
+
+    elif panel_shape == 'diamond':
+        d = min_spacing * 0.9
+
+        def _diamond(cx, cy, r):
+            return [[cy - r, cx], [cy, cx + r], [cy + r, cx], [cy, cx - r], [cy - r, cx]]
+
+        row_i, cy = 0, d
+        while cy < h + d:
+            cx = (d if row_i % 2 == 1 else 0.0) + d
+            while cx < w + d:
+                b = _sample(cy, cx)
+                if b < threshold:
+                    r = d * (0.5 + (1 - b) * 0.5) if style == 'organic' else d
+                    elements.append({'type': 'polyline', 'points': _diamond(cx, cy, r),
+                                     'layer': 'PATTERN_CUT', 'level': 0})
+                cx += d * 2
+                if len(elements) >= max_elements:
+                    break
+            cy += d;  row_i += 1
+            if len(elements) >= max_elements:
+                break
+
+    elif panel_shape == 'wave':
+        amp_base = min_spacing * 0.5
+        freq     = 2.0 * _np.pi / max(1.0, min_spacing * 3)
+        x_step   = max(1, int(min_spacing * 0.4))
+        y        = min_spacing / 2
+        while y < h:
+            pts = []
+            for x in range(0, int(w) + 1, x_step):
+                b   = _sample(y, x)
+                amp = amp_base * (1.0 - b) * 1.5
+                pts.append([y + amp * _np.sin(x * freq), float(x)])
+            if len(pts) >= 2:
+                elements.append({'type': 'polyline', 'points': pts, 'layer': 'PATTERN_CUT', 'level': 0})
+            y += min_spacing
+            if len(elements) >= max_elements:
+                break
+
+    if len(elements) >= max_elements:
+        warnings.append(f'Element limit ({max_elements}) reached')
+    return elements, warnings
+
+
+def _render_pattern_preview(elements: list, w: int, h: int, img_gray=None) -> str:
+    """Render pattern elements onto a dark PIL image → base64 PNG data-URI."""
+    from PIL import ImageDraw
+    canvas = _PIL.new('RGB', (w, h), (8, 8, 18))
+    if img_gray is not None:
+        ghost_u8 = (_np.clip(img_gray, 0, 1) * 30).astype(_np.uint8)
+        ghost    = _PIL.fromarray(ghost_u8, 'L').convert('RGB')
+        blended  = (_np.array(canvas, dtype=float) * 0.7
+                    + _np.array(ghost,  dtype=float) * 0.3).astype(_np.uint8)
+        canvas   = _PIL.fromarray(blended, 'RGB')
+    draw = ImageDraw.Draw(canvas)
+    layer_colors = {
+        'PATTERN_CUT':     (34,  211, 238),
+        'PATTERN_GROOVE':  (167, 139, 250),
+        'PATTERN_HOLES':   (74,  222, 128),
+        'ANALYSIS_GUIDES': (251, 146,  60),
+    }
+    for el in elements:
+        color = layer_colors.get(el.get('layer', 'PATTERN_CUT'), (180, 180, 180))
+        et    = el.get('type')
+        if et == 'polyline':
+            pts_xy = [(float(p[1]), float(p[0])) for p in el['points']]
+            if len(pts_xy) >= 2:
+                draw.line(pts_xy, fill=color, width=1)
+        elif et == 'circle':
+            cx, cy, r = el['cx'], el['cy'], el['r']
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=1)
+        elif et == 'line':
+            draw.line([(el['x1'], el['y1']), (el['x2'], el['y2'])], fill=color, width=1)
+    return _encode_png(_np.array(canvas))
+
+
+def _run_fabrication_checks(elements, pattern_type, min_spacing, min_hole_size, scale, img_w, img_h):
+    """scale = mm per pixel; returns fabrication readiness dict."""
+    OP_MAP = {
+        'perforation':    ('Drilling',              'CNC drilling — variable hole grid'),
+        'groove':         ('Groove routing',        'Ball-end / V-groove routing along scan lines'),
+        'contour_relief': ('Multi-level engraving', 'Multi-pass contour engraving across brightness levels'),
+        'facade':         ('Contour cutting',       'Through-cut geometric panel openings'),
+    }
+    op_type, op_label = OP_MAP.get(pattern_type, ('Unknown', 'Unknown operation'))
+    checks = []
+    feed_rate = 3000.0   # mm/min conservative
+    setup_min = 10.0
+
+    circles    = [e for e in elements if e.get('type') == 'circle']
+    path_els   = [e for e in elements if e.get('type') in ('line', 'polyline')]
+
+    total_path_mm = 0.0
+    for el in path_els:
+        if el['type'] == 'line':
+            dx = (el['x2'] - el['x1']) * scale
+            dy = (el['y2'] - el['y1']) * scale
+            total_path_mm += (dx**2 + dy**2) ** 0.5
+        else:
+            pts = el['points']
+            for i in range(len(pts) - 1):
+                dx = (pts[i + 1][1] - pts[i][1]) * scale
+                dy = (pts[i + 1][0] - pts[i][0]) * scale
+                total_path_mm += (dx**2 + dy**2) ** 0.5
+
+    estimated_time_min = round(setup_min + len(circles) * 3.5 / 60.0 + total_path_mm / feed_rate, 1)
+
+    # 1 — Hole diameter (perforation only)
+    if pattern_type == 'perforation' and circles:
+        min_diam_mm = min(e['r'] for e in circles) * 2 * scale
+        if min_diam_mm < 2.0:
+            checks.append({'severity': 'error',   'code': 'hole_too_small',
+                'message': f'Smallest hole is {min_diam_mm:.1f} mm — absolute minimum drill diameter is 2 mm'})
+        elif min_diam_mm < 3.0:
+            checks.append({'severity': 'warning', 'code': 'hole_below_safe',
+                'message': f'Smallest hole is {min_diam_mm:.1f} mm — recommended safe minimum is 3 mm'})
+        else:
+            checks.append({'severity': 'ok',      'code': 'hole_diameter',
+                'message': f'Hole diameters OK (min {min_diam_mm:.1f} mm)'})
+
+    # 2 — Hole clearance (perforation only)
+    if pattern_type == 'perforation' and circles:
+        max_r_px     = max(e['r'] for e in circles)
+        clearance_mm = (min_spacing - 2 * max_r_px) * scale
+        if clearance_mm < 0.5:
+            checks.append({'severity': 'error',   'code': 'holes_too_close',
+                'message': f'Hole clearance is {clearance_mm:.1f} mm — risk of material breakout'})
+        elif clearance_mm < 1.5:
+            checks.append({'severity': 'warning', 'code': 'holes_close',
+                'message': f'Hole clearance is {clearance_mm:.1f} mm — consider increasing Min Spacing'})
+        else:
+            checks.append({'severity': 'ok',      'code': 'hole_spacing',
+                'message': f'Hole clearance OK ({clearance_mm:.1f} mm)'})
+
+    # 3 — Groove line spacing (groove only)
+    if pattern_type == 'groove':
+        spacing_mm = min_spacing * scale
+        if spacing_mm < 2.0:
+            checks.append({'severity': 'error',   'code': 'grooves_too_close',
+                'message': f'Groove spacing is {spacing_mm:.1f} mm — minimum recommended is 2 mm'})
+        elif spacing_mm < 4.0:
+            checks.append({'severity': 'warning', 'code': 'grooves_close',
+                'message': f'Groove spacing is {spacing_mm:.1f} mm — tight for router; consider 4 mm+'})
+        else:
+            checks.append({'severity': 'ok',      'code': 'groove_spacing',
+                'message': f'Groove spacing OK ({spacing_mm:.1f} mm)'})
+
+    # 4 — Tiny contours (contour_relief and facade)
+    if pattern_type in ('contour_relief', 'facade'):
+        min_perim_mm = max(3.0, min_spacing * 2 * scale)
+        tiny = []
+        for el in elements:
+            if el.get('type') == 'polyline':
+                pts  = el['points']
+                perim = sum(
+                    ((pts[i + 1][1] - pts[i][1])**2 + (pts[i + 1][0] - pts[i][0])**2) ** 0.5
+                    for i in range(len(pts) - 1)
+                ) * scale
+                if perim < min_perim_mm:
+                    tiny.append(perim)
+        if tiny:
+            pct = len(tiny) / max(1, len(elements)) * 100
+            if pct > 20:
+                checks.append({'severity': 'error',   'code': 'tiny_contours',
+                    'message': f'{len(tiny)} contours ({pct:.0f}%) too small (<{min_perim_mm:.1f} mm) — increase Min Spacing or Detail'})
+            else:
+                checks.append({'severity': 'warning', 'code': 'tiny_contours',
+                    'message': f'{len(tiny)} tiny contours (<{min_perim_mm:.1f} mm) — some may not cut cleanly'})
+        else:
+            checks.append({'severity': 'ok', 'code': 'contour_size',
+                'message': 'Contour sizes OK'})
+
+    # 5 — CNC time
+    if estimated_time_min > 120:
+        checks.append({'severity': 'error',   'code': 'cnc_time',
+            'message': f'Estimated time is {estimated_time_min:.0f} min — reduce Max Elements or increase Min Spacing'})
+    elif estimated_time_min > 45:
+        checks.append({'severity': 'warning', 'code': 'cnc_time',
+            'message': f'Estimated time is {estimated_time_min:.0f} min — consider reducing complexity'})
+    else:
+        checks.append({'severity': 'ok',      'code': 'cnc_time',
+            'message': f'Estimated CNC time: {estimated_time_min:.0f} min'})
+
+    # 6 — Sheet size (standard 2440 × 1220 mm)
+    pw_mm, ph_mm = img_w * scale, img_h * scale
+    if pw_mm > 2440 or ph_mm > 1220:
+        checks.append({'severity': 'error',   'code': 'sheet_size',
+            'message': f'Pattern is {pw_mm:.0f}×{ph_mm:.0f} mm — exceeds standard sheet (2440×1220 mm)'})
+    elif pw_mm > 2196 or ph_mm > 1098:
+        checks.append({'severity': 'warning', 'code': 'sheet_size',
+            'message': f'Pattern is {pw_mm:.0f}×{ph_mm:.0f} mm — close to sheet edge (2440×1220 mm)'})
+    else:
+        checks.append({'severity': 'ok',      'code': 'sheet_size',
+            'message': f'Pattern fits on sheet ({pw_mm:.0f}×{ph_mm:.0f} mm)'})
+
+    return {
+        'operation_type':     op_type,
+        'operation_label':    op_label,
+        'estimated_time_min': estimated_time_min,
+        'checks':             checks,
+    }
+
+
+class AiPatternExportRequest(BaseModel):
+    elements:     list
+    image_width:  int
+    image_height: int
+    scale:        float = 1.0
+    filename:     str   = 'pattern.dxf'
+
+
+@app.post('/photo-to-dxf/ai-pattern')
+async def photo_ai_pattern(
+    file:           UploadFile = File(...),
+    pattern_type:   str   = Form('contour_relief'),
+    style:          str   = Form('clean'),
+    detail:         float = Form(5.0),
+    min_spacing:    float = Form(8.0),
+    min_hole_size:  float = Form(4.0),
+    max_elements:   int   = Form(1500),
+    panel_shape:    str   = Form('hexagon'),
+    blur:           float = Form(1.0),
+    invert:         bool  = Form(False),
+    scale_mm_per_px: float = Form(1.0),
+):
+    from scipy.ndimage import gaussian_filter
+    data     = await file.read()
+    img_pil  = _PIL.open(_io.BytesIO(data)).convert('RGB')
+    img_rgb  = _np.array(img_pil, dtype=float) / 255.0
+    img_gray = (0.2126 * img_rgb[:, :, 0]
+              + 0.7152 * img_rgb[:, :, 1]
+              + 0.0722 * img_rgb[:, :, 2])
+    h, w = img_gray.shape
+    if blur > 0:
+        img_gray = gaussian_filter(img_gray, sigma=blur)
+    if invert:
+        img_gray = 1.0 - img_gray
+    analysis = _analyze_for_pattern(img_gray)
+    all_warnings: list = []
+    if pattern_type == 'contour_relief':
+        elements, warns = _gen_contour_relief(img_gray, detail, style, min_spacing, max_elements)
+    elif pattern_type == 'groove':
+        elements, warns = _gen_groove_pattern(img_gray, detail, style, min_spacing, max_elements, analysis)
+    elif pattern_type == 'perforation':
+        elements, warns = _gen_perforation(img_gray, detail, style, min_spacing, min_hole_size, max_elements)
+    elif pattern_type == 'facade':
+        elements, warns = _gen_facade(img_gray, detail, style, min_spacing, max_elements, panel_shape)
+    else:
+        raise HTTPException(status_code=400, detail=f'Unknown pattern_type: {pattern_type}')
+    all_warnings.extend(warns)
+    n_by_layer: dict = {}
+    for el in elements:
+        lyr = el.get('layer', 'PATTERN_CUT')
+        n_by_layer[lyr] = n_by_layer.get(lyr, 0) + 1
+    preview_image = _render_pattern_preview(elements, w, h, img_gray)
+    bmap_u8       = (analysis['brightness_map'] * 255).astype(_np.uint8)
+    fabrication   = _run_fabrication_checks(
+        elements, pattern_type, min_spacing, min_hole_size, scale_mm_per_px, w, h
+    )
+    return JSONResponse({
+        'pattern_type': pattern_type,
+        'style':        style,
+        'n_elements':   len(elements),
+        'n_by_layer':   n_by_layer,
+        'image_width':  w,
+        'image_height': h,
+        'analysis': {
+            'edge_density':       round(analysis['edge_density'],       4),
+            'contrast':           round(analysis['contrast'],           4),
+            'dominant_angle_deg': round(analysis['dominant_angle_deg'], 1),
+            'brightness_map':     _encode_png(bmap_u8),
+        },
+        'elements':      elements,
+        'preview_image': preview_image,
+        'warnings':      all_warnings,
+        'fabrication':   fabrication,
+    })
+
+
+@app.post('/photo-to-dxf/export-ai-pattern')
+async def export_ai_pattern(req: AiPatternExportRequest):
+    import ezdxf
+    doc = ezdxf.new('R2010')
+    msp = doc.modelspace()
+    for lname, lcolor in {
+        'PATTERN_CUT':     4,
+        'PATTERN_GROOVE':  6,
+        'PATTERN_HOLES':   3,
+        'ANALYSIS_GUIDES': 2,
+    }.items():
+        if doc.layers.get(lname) is None:
+            doc.layers.new(lname, dxfattribs={'color': lcolor})
+    img_h = float(req.image_height)
+    s     = float(req.scale)
+    for el in req.elements:
+        layer = el.get('layer', 'PATTERN_CUT')
+        et    = el.get('type')
+        if et == 'polyline':
+            pts = [(p[1] * s, (img_h - p[0]) * s) for p in el['points']]
+            if len(pts) >= 2:
+                msp.add_lwpolyline(pts, dxfattribs={'layer': layer})
+        elif et == 'circle':
+            msp.add_circle(
+                (el['cx'] * s, (img_h - el['cy']) * s),
+                el['r'] * s,
+                dxfattribs={'layer': layer},
+            )
+        elif et == 'line':
+            msp.add_line(
+                (el['x1'] * s, (img_h - el['y1']) * s),
+                (el['x2'] * s, (img_h - el['y2']) * s),
+                dxfattribs={'layer': layer},
+            )
+    buf = _io.BytesIO()
+    doc.write(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type='application/dxf',
+        headers={'Content-Disposition': f'attachment; filename="{req.filename}"'},
+    )
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

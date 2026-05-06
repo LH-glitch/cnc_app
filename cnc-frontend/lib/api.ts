@@ -214,7 +214,7 @@ export async function exportDXFPerBoard(
 
 // ── Photo → DXF ───────────────────────────────────────────────────────────────
 
-export type TraceMode = "accurate" | "contour_art" | "stroke" | "halftone";
+export type TraceMode = "accurate" | "contour_art" | "stroke" | "halftone" | "one_line" | "ai_pattern";
 
 export interface TraceParams {
   blur: number;        // 0–5  pre-blur (denoise)
@@ -284,14 +284,24 @@ export interface HalftoneParams {
   max_radius: number;   // 1–20 px maximum circle radius
   contrast: number;     // 0.5–3.0 contrast boost before mapping
   invert: boolean;
+  placement_mode?: "organic_density" | "hex_packing" | "flow_field";
+  randomness?: number;
+  density_sensitivity?: number;
 }
 
 export interface HalftoneResult {
   circles: [number, number, number][];  // [row, col, radius]
   preview_image: string;                // base64 PNG preview
+  density_heatmap?: string;
   n_circles: number;
   image_width: number;
   image_height: number;
+  placement_mode?: string;
+  open_area_pct?: number;
+  min_bridge_px?: number;
+  max_hole_diameter_px?: number;
+  strength_score?: number;
+  strength_label?: string;
 }
 
 export async function traceHalftone(
@@ -305,6 +315,9 @@ export async function traceHalftone(
   form.append("max_radius", String(params.max_radius));
   form.append("contrast",   String(params.contrast));
   form.append("invert",     String(params.invert));
+  if (params.placement_mode) form.append("placement_mode", params.placement_mode);
+  if (params.randomness != null) form.append("randomness", String(params.randomness));
+  if (params.density_sensitivity != null) form.append("density_sensitivity", String(params.density_sensitivity));
 
   const resp = await fetch(`${BASE}/photo-to-dxf/halftone`, { method: "POST", body: form });
   if (!resp.ok) throw new Error(`Halftone trace failed (${resp.status}): ${await resp.text()}`);
@@ -359,6 +372,173 @@ export async function exportPhotoAsDXF(
     body: JSON.stringify({ contours, image_width: imageWidth, image_height: imageHeight, scale, filename }),
   });
   if (!resp.ok) throw new Error(`Export failed (${resp.status}): ${await resp.text()}`);
+  const blob = await resp.blob();
+  triggerDownload(blob, getFilename(resp, filename));
+}
+
+// ── One-Line Drawing ─────────────────────────────────────────────────────────
+
+export interface OneLineParams {
+  detail: number;       // 1–10 skeleton detail level
+  simplify: number;     // 0–15 RDP epsilon
+  jump_penalty: number; // 0–1 direction-continuity weight
+  blur: number;         // 0–5 pre-blur
+  invert: boolean;
+}
+
+export interface OneLineResult {
+  path: [number, number][];   // [[row, col], ...]
+  jump_indices: number[];     // indices i where path[i]→path[i+1] is a jump connector
+  n_points: number;
+  n_jumps: number;
+  longest_jump: number;       // length of the longest jump connector in pixels
+  total_length_px: number;
+  preview_image: string;      // base64 PNG
+  skeleton_image: string;
+  cleaned_image: string;
+  image_width: number;
+  image_height: number;
+}
+
+export async function traceOneLine(
+  file: File,
+  params: OneLineParams,
+): Promise<OneLineResult> {
+  const form = new FormData();
+  form.append("file",         file);
+  form.append("detail",       String(params.detail));
+  form.append("simplify",     String(params.simplify));
+  form.append("jump_penalty", String(params.jump_penalty));
+  form.append("blur",         String(params.blur));
+  form.append("invert",       String(params.invert));
+
+  const resp = await fetch(`${BASE}/photo-to-dxf/one-line`, { method: "POST", body: form });
+  if (!resp.ok) throw new Error(`One-line trace failed (${resp.status}): ${await resp.text()}`);
+  return resp.json();
+}
+
+export async function exportOneLineDXF(
+  path: [number, number][],
+  imageWidth: number,
+  imageHeight: number,
+  scale: number,
+  filename = "one-line.dxf",
+): Promise<void> {
+  const resp = await fetch(`${BASE}/photo-to-dxf/export-one-line`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, image_width: imageWidth, image_height: imageHeight, scale, filename }),
+  });
+  if (!resp.ok) throw new Error(`One-line export failed (${resp.status}): ${await resp.text()}`);
+  const blob = await resp.blob();
+  triggerDownload(blob, getFilename(resp, filename));
+}
+
+// ── AI Pattern Maker ──────────────────────────────────────────────────────────
+
+export type PatternType  = "contour_relief" | "groove" | "perforation" | "facade";
+export type PatternStyle = "clean" | "organic" | "geometric" | "facade";
+export type PanelShape   = "hexagon" | "triangle" | "diamond" | "wave";
+
+export interface AiPatternParams {
+  pattern_type:  PatternType;
+  style:         PatternStyle;
+  detail:        number;
+  min_spacing:   number;
+  min_hole_size: number;
+  max_elements:  number;
+  panel_shape:   PanelShape;
+}
+
+export interface AiPatternElement {
+  type:    "polyline" | "circle" | "line";
+  layer:   string;
+  level?:  number;
+  points?: [number, number][];
+  cx?:     number;
+  cy?:     number;
+  r?:      number;
+  x1?:     number;
+  y1?:     number;
+  x2?:     number;
+  y2?:     number;
+}
+
+export interface AiPatternAnalysis {
+  edge_density:       number;
+  contrast:           number;
+  dominant_angle_deg: number;
+  brightness_map:     string;
+}
+
+export interface FabricationCheck {
+  severity: "ok" | "warning" | "error";
+  code:     string;
+  message:  string;
+}
+
+export interface FabricationInfo {
+  operation_type:     string;
+  operation_label:    string;
+  estimated_time_min: number;
+  checks:             FabricationCheck[];
+}
+
+export interface AiPatternResult {
+  pattern_type:  string;
+  style:         string;
+  n_elements:    number;
+  n_by_layer:    Record<string, number>;
+  image_width:   number;
+  image_height:  number;
+  analysis:      AiPatternAnalysis;
+  elements:      AiPatternElement[];
+  preview_image: string;
+  warnings:      string[];
+  fabrication:   FabricationInfo;
+}
+
+export async function generateAiPattern(
+  file:          File,
+  params:        AiPatternParams,
+  blur           = 1.0,
+  invert         = false,
+  scaleMmPerPx   = 1.0,
+): Promise<AiPatternResult> {
+  const form = new FormData();
+  form.append("file",            file);
+  form.append("pattern_type",    params.pattern_type);
+  form.append("style",           params.style);
+  form.append("detail",          String(params.detail));
+  form.append("min_spacing",     String(params.min_spacing));
+  form.append("min_hole_size",   String(params.min_hole_size));
+  form.append("max_elements",    String(params.max_elements));
+  form.append("panel_shape",     params.panel_shape);
+  form.append("blur",            String(blur));
+  form.append("invert",          String(invert));
+  form.append("scale_mm_per_px", String(scaleMmPerPx));
+  const resp = await fetch(`${BASE}/photo-to-dxf/ai-pattern`, { method: "POST", body: form });
+  if (!resp.ok) throw new Error(`AI Pattern failed (${resp.status}): ${await resp.text()}`);
+  return resp.json();
+}
+
+export async function exportAiPatternDXF(
+  result:   AiPatternResult,
+  scale:    number,
+  filename  = "pattern.dxf",
+): Promise<void> {
+  const resp = await fetch(`${BASE}/photo-to-dxf/export-ai-pattern`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({
+      elements:     result.elements,
+      image_width:  result.image_width,
+      image_height: result.image_height,
+      scale,
+      filename,
+    }),
+  });
+  if (!resp.ok) throw new Error(`Pattern export failed (${resp.status}): ${await resp.text()}`);
   const blob = await resp.blob();
   triggerDownload(blob, getFilename(resp, filename));
 }

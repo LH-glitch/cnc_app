@@ -325,7 +325,7 @@ export default function SlicerPage() {
               onDrop={onDrop}
               onClick={() => fileRef.current?.click()}
             >
-              <input ref={fileRef} type="file" accept=".stl,.STL"
+              <input ref={fileRef} type="file" accept=".stl,.STL,.obj,.OBJ"
                 style={{ display: "none" }} onChange={onFileChange} />
               {file ? (
                 <div style={{ display: "flex", alignItems: "center", gap: 10, width: "100%" }}>
@@ -342,16 +342,19 @@ export default function SlicerPage() {
                       {formatBytes(file.size)} · click to replace
                     </div>
                   </div>
+                  <span className="chip chip-violet" style={{ textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    {file.name.split('.').pop()?.toUpperCase() ?? "3D"}
+                  </span>
                   <span className="chip chip-green">Ready</span>
                 </div>
               ) : (
                 <>
                   <div style={{ fontSize: 26, opacity: 0.4, lineHeight: 1 }}>⬆</div>
                   <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text-muted)", textAlign: "center" }}>
-                    Drop STL here or click to browse
+                    Drop 3D model here or click to browse
                   </div>
                   <div style={{ fontSize: 11, color: "var(--text-subtle)" }}>
-                    ASCII and binary STL supported
+                    STL and OBJ supported
                   </div>
                 </>
               )}
@@ -593,7 +596,7 @@ export default function SlicerPage() {
               ) : (
                 <>
                   <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text-primary)" }}>
-                    Upload an STL to get started
+                    Upload a 3D model to get started
                   </div>
                   <div style={{
                     fontSize: 13, color: "var(--text-muted)", textAlign: "center",
@@ -609,7 +612,7 @@ export default function SlicerPage() {
                     background: "rgba(255,255,255,0.03)",
                     border: "1px solid var(--glass-border)", borderRadius: 10,
                   }}>
-                    {["Upload STL", "Configure", "Slice", "Export DXF"].map((s, i, a) => (
+                    {["Upload 3D model", "Configure", "Slice", "Export DXF"].map((s, i, a) => (
                       <div key={i} style={{ display: "flex", alignItems: "center", gap: 0, flexShrink: 0 }}>
                         <span style={{ fontSize: 11, color: "var(--text-subtle)", padding: "0 10px" }}>{s}</span>
                         {i < a.length - 1 && (
