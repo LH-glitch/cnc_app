@@ -475,6 +475,15 @@ async def export_dxf_per_board(
     )
 
 
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "service": "CNC DXF Generator API",
+        "docs": "/docs",
+    }
+
+
 # ── GET /health ───────────────────────────────────────────────────────────────
 
 @app.get('/health', summary='Liveness check', include_in_schema=False)
